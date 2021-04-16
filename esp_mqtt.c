@@ -48,15 +48,25 @@ char * esp_mqtt_lwt_topic = NULL;
 
 static esp_lwmqtt_timer_t esp_mqtt_timer_keep_alive, esp_mqtt_timer_command;
 
-static TaskHandle_t esp_mqtt_task;
-static QueueHandle_t esp_mqtt_event_queue = NULL;
-
 typedef struct {
   lwmqtt_string_t topic;
   lwmqtt_message_t message;
 } esp_mqtt_event_t;
 
-#define CONFIG_MQTT_LOG_PAYLOAD_LIMIT 2048
+#define MQTT_CLIENT_QUEUE_ITEM_SIZE sizeof(esp_mqtt_event_t*)
+#define MQTT_LOG_PAYLOAD_LIMIT 2048
+
+static TaskHandle_t esp_mqtt_task;
+static QueueHandle_t esp_mqtt_event_queue = NULL;
+
+#if CONFIG_MQTT_STATIC_ALLOCATION
+StaticSemaphore_t esp_mqtt_main_mutex_buffer;
+StaticSemaphore_t esp_mqtt_select_mutex_buffer;
+StaticQueue_t esp_mqtt_event_queue_buffer;
+uint8_t esp_mqtt_event_queue_storage[CONFIG_MQTT_CLIENT_QUEUE_SIZE * MQTT_CLIENT_QUEUE_ITEM_SIZE];
+StaticTask_t esp_mqtt_task_buffer;
+StackType_t esp_mqtt_task_stack[CONFIG_MQTT_CLIENT_STACK_SIZE];
+#endif // CONFIG_MQTT_STATIC_ALLOCATION
 
 static const char * lwmqtt_err_names[] = {
   "SUCCESS",
@@ -94,12 +104,21 @@ bool esp_mqtt_init(mqtt_status_callback_t scb, mqtt_message_callback_t mcb)
   esp_mqtt_message_callback = mcb;
 
   // create mutexes
+  #if CONFIG_MQTT_STATIC_ALLOCATION
+  esp_mqtt_main_mutex = xSemaphoreCreateMutexStatic(&esp_mqtt_main_mutex_buffer);
+  #else
   esp_mqtt_main_mutex = xSemaphoreCreateMutex();
+  #endif // CONFIG_MQTT_STATIC_ALLOCATION
   if (!esp_mqtt_main_mutex) {
     rlog_e(tagMQTT, "Can't create main mutex!");
     return false;
   };
+  
+  #if CONFIG_MQTT_STATIC_ALLOCATION
+  esp_mqtt_select_mutex = xSemaphoreCreateMutexStatic(&esp_mqtt_select_mutex_buffer);
+  #else
   esp_mqtt_select_mutex = xSemaphoreCreateMutex();
+  #endif // CONFIG_MQTT_STATIC_ALLOCATION
   if (!esp_mqtt_select_mutex) {
     vSemaphoreDelete(esp_mqtt_main_mutex);
     rlog_e(tagMQTT, "Can't create select mutex!");
@@ -550,7 +569,11 @@ bool esp_mqtt_start()
 
      // create queue
     if (!esp_mqtt_event_queue) {
-      esp_mqtt_event_queue = xQueueCreate(CONFIG_MQTT_CLIENT_QUEUE_SIZE, sizeof(esp_mqtt_event_t*));
+      #if CONFIG_MQTT_STATIC_ALLOCATION
+      esp_mqtt_event_queue = xQueueCreateStatic(CONFIG_MQTT_CLIENT_QUEUE_SIZE, MQTT_CLIENT_QUEUE_ITEM_SIZE, &(esp_mqtt_event_queue_storage[0]), &esp_mqtt_event_queue_buffer);
+      #else
+      esp_mqtt_event_queue = xQueueCreate(CONFIG_MQTT_CLIENT_QUEUE_SIZE, MQTT_CLIENT_QUEUE_ITEM_SIZE);
+      #endif // CONFIG_MQTT_STATIC_ALLOCATION
       if (!esp_mqtt_event_queue) {
         rloga_e("Failed to create a event queue MQTT client!");
         ESP_MQTT_UNLOCK_MAIN();
@@ -559,7 +582,11 @@ bool esp_mqtt_start()
     };
     
     // start task
+    #if CONFIG_MQTT_STATIC_ALLOCATION
+    esp_mqtt_task = xTaskCreateStaticPinnedToCore(esp_mqtt_task_exec, mqttTaskName, CONFIG_MQTT_CLIENT_STACK_SIZE, NULL, CONFIG_MQTT_CLIENT_PRIORITY, esp_mqtt_task_stack, &esp_mqtt_task_buffer, CONFIG_MQTT_CLIENT_CORE); 
+    #else
     xTaskCreatePinnedToCore(esp_mqtt_task_exec, mqttTaskName, CONFIG_MQTT_CLIENT_STACK_SIZE, NULL, CONFIG_MQTT_CLIENT_PRIORITY, &esp_mqtt_task, CONFIG_MQTT_CLIENT_CORE); 
+    #endif // CONFIG_MQTT_STATIC_ALLOCATION
     if (!esp_mqtt_task) {
       vQueueDelete(esp_mqtt_event_queue);
       esp_mqtt_event_queue = NULL;
@@ -716,7 +743,7 @@ bool esp_mqtt_publish(const char *topic, const char *payload, int qos, bool reta
   size_t len = strlen(payload);
   bool ret = esp_mqtt_publish_bytes(topic, (uint8_t*)payload, len, qos, retained);
   if (ret) {
-    if (len > CONFIG_MQTT_LOG_PAYLOAD_LIMIT) {
+    if (len > MQTT_LOG_PAYLOAD_LIMIT) {
       rlog_i(tagMQTT, "Published: %s [ %d bytes ]", topic, len);
     } else {
       rlog_i(tagMQTT, "Published: %s [ %s ]", topic, payload);

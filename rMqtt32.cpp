@@ -54,6 +54,15 @@ static const char* mqttTaskName = "mqttOutbox";
 TaskHandle_t _mqttTask;
 QueueHandle_t _mqttQueue = NULL;
 
+#define MQTT_OUTBOX_QUEUE_ITEM_SIZE sizeof(mqttPub_t*)
+
+#if CONFIG_MQTT_STATIC_ALLOCATION
+StaticQueue_t _mqttQueueBuffer;
+uint8_t _mqttQueueStorage[CONFIG_MQTT_OUTBOX_QUEUE_SIZE * MQTT_OUTBOX_QUEUE_ITEM_SIZE];
+StaticTask_t _mqttTaskBuffer;
+StackType_t _mqttTaskStack[CONFIG_MQTT_OUTBOX_STACK_SIZE];
+#endif // CONFIG_MQTT_STATIC_ALLOCATION
+
 // -----------------------------------------------------------------------------------------------------------------------
 // ---------------------------------------------------- Publish main -----------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
@@ -1013,7 +1022,11 @@ bool mqttTaskCreate()
     #endif
 
     if (_mqttQueue == NULL) {
-      _mqttQueue = xQueueCreate(CONFIG_MQTT_OUTBOX_QUEUE_SIZE, sizeof(mqttPub_t*));
+      #if CONFIG_MQTT_STATIC_ALLOCATION
+      _mqttQueue = xQueueCreateStatic(CONFIG_MQTT_OUTBOX_QUEUE_SIZE, MQTT_OUTBOX_QUEUE_ITEM_SIZE, &(_mqttQueueStorage[0]), &_mqttQueueBuffer);
+      #else
+      _mqttQueue = xQueueCreate(CONFIG_MQTT_OUTBOX_QUEUE_SIZE, MQTT_OUTBOX_QUEUE_ITEM_SIZE);
+      #endif // CONFIG_MQTT_STATIC_ALLOCATION
       if (_mqttQueue == NULL) {
         rloga_e("Failed to create a outbox queue MQTT client!");
         ledSysStateSet(SYSLED_ERROR, false);
@@ -1021,7 +1034,11 @@ bool mqttTaskCreate()
       };
     };
     
+    #if CONFIG_MQTT_STATIC_ALLOCATION
+    _mqttTask = xTaskCreateStaticPinnedToCore(mqttTaskExec, mqttTaskName, CONFIG_MQTT_OUTBOX_STACK_SIZE, NULL, CONFIG_MQTT_OUTBOX_PRIORITY, _mqttTaskStack, &_mqttTaskBuffer, CONFIG_MQTT_OUTBOX_CORE); 
+    #else
     xTaskCreatePinnedToCore(mqttTaskExec, mqttTaskName, CONFIG_MQTT_OUTBOX_STACK_SIZE, NULL, CONFIG_MQTT_OUTBOX_PRIORITY, &_mqttTask, CONFIG_MQTT_OUTBOX_CORE); 
+    #endif // CONFIG_MQTT_STATIC_ALLOCATION
     if (_mqttTask == NULL) {
       vQueueDelete(_mqttQueue);
       rloga_e("Failed to create task for sending data to MQTT!");
