@@ -1,13 +1,13 @@
 /* 
-   EN: MQTT client for ESP32 (ESP-IDF), delayed message send queue
-   RU: MQTT клиент для ESP32 (ESP-IDF), очередь отправки сообщений с задержкой
+   EN: MQTT client for ESP32 (ESP-IDF) with outbound send queue (for servers with call intervals)
+   RU: Клиент MQTT ESP32 (ESP-IDF) с очередью отправки исходящих сообщений (для серверов с интервалами обращения)
    --------------------------
    (с) 2021 Разживин Александр | Razzhivin Alexander
    kotyara12@yandex.ru | https://kotyara12.ru | tg: @kotyara1971
 */
 
-#ifndef __RMQTT32_H__
-#define __RMQTT32_H__
+#ifndef __RE_MQTT_H__
+#define __RE_MQTT_H__
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -54,5 +54,5 @@ void silentModeSetCallback(silent_mode_change_callback_t cb);
 }
 #endif
 
-#endif // __RMQTT32_H__
+#endif // __RE_MQTT_H__
 

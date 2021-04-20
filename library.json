@@ -1,0 +1,17 @@
+{
+  "name": "reMqtt",
+  "version": "2.0.0",
+  "description": "MQTT client for ESP32 (ESP-IDF) with outbound send queue (for servers with call intervals)",
+  "keywords": "mqtt",
+  "authors":
+  [
+    {
+      "name": "Alexander Razzhivin",
+      "email": "kotyara12@yandex.ru",
+      "url": "https://kotyara12.ru"
+    }
+  ],
+  "license": "MIT",
+  "frameworks": ["espidf"],
+  "platforms": ["espressif32"]
+}

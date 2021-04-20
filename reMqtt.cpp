@@ -1,14 +1,14 @@
-#include "rMqtt32.h"
 #include <stddef.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include "rStrings.h"
-#include "rEsp32.h"
-#include "rNvs32.h"
-#include "rWifi32.h"
-#include "rLedSys32.h"
 #include "rLog.h"
+#include "reEsp32.h"
+#include "reWifi.h"
+#include "reMqtt.h"
+#include "reNvs.h"
+#include "reLedSys.h"
 #include "project_config.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -29,7 +29,7 @@ extern "C" {
 #include "esp_spi_flash.h"
 #endif // CONFIG_MQTT_SYSINFO_ENABLE
 #if CONFIG_TELEGRAM_ENABLE
-#include "rTgSend32.h"
+#include "reTgSend.h"
 #endif // CONFIG_TELEGRAM_ENABLE
 
 typedef struct mqttPub_t {
