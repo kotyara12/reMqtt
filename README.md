@@ -1,6 +1,6 @@
 # MQTT client for ESP32 / ESP-IDF
 
-MQTT client for ESP32 (ESP-IDF) with outbound send queue (for servers with call intervals)
+MQTT client for ESP32 (ESP-IDF) with outbound send queue (for servers with call intervals), based on esp-mqtt by Joël Gähwiler (https://github.com/256dpi/esp-mqtt)
 
 ## Dependencies:
   - https://github.com/kotyara12/rLog
