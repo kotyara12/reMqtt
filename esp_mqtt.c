@@ -1,8 +1,8 @@
 #include "esp_mqtt.h"
 #include "project_config.h"
-#include "rWiFi32.h"
-#include "rEsp32.h"
 #include "rLog.h"
+#include "reWiFi.h"
+#include "reEsp32.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
