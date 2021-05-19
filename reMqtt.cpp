@@ -566,6 +566,9 @@ typedef struct paramsEntry_t {
   const char* key;
   void *value;
   char *topic;
+  #if CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
+  char *confirm;
+  #endif // CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
   int qos;
   STAILQ_ENTRY(paramsEntry_t) next;
 } paramsEntry_t;
@@ -651,8 +654,14 @@ void paramsMqttSubscribeEntry(paramsEntryHandle_t entry)
 {
   // Generating a topic for a subscription
   char * _topic = nullptr;
+  #if CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
+  char * _confirm = nullptr;
+  #endif // CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
   if (entry->type_param == OPT_KIND_PARAMETER) {
     _topic = mqttGetTopic(CONFIG_MQTT_PARAMS_TOPIC, entry->group, entry->key);
+    #if CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
+    _confirm = mqttGetTopic(CONFIG_MQTT_CONFIRM_TOPIC, entry->group, entry->key);
+    #endif // CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
   } else {
     _topic = mqttGetTopic(entry->group, entry->key, nullptr);
   };
@@ -662,9 +671,19 @@ void paramsMqttSubscribeEntry(paramsEntryHandle_t entry)
     if (mqttSubscribe(_topic, entry->qos)) {
       // We succeeded in subscribing, we save the topic to identify incoming messages
       entry->topic = _topic;
+      // If confirmation is enabled, publish the current values
+      #if CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
+      entry->confirm = _confirm;
+      char* str_value = value2string(entry->type_value, entry->value);
+      mqttPublish(entry->confirm, str_value, CONFIG_MQTT_CONFIRM_QOS, CONFIG_MQTT_CONFIRM_RETAINED, true, false, false);
+      if (str_value) free(str_value);
+      #endif // CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
     } else {
       // Subscribe failed, delete the topic from heap (it will be generated after reconnecting to the server)
       free(_topic);
+      #if CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
+      if (_confirm) free(_confirm);
+      #endif // CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
     };
   };
 }
@@ -699,6 +718,10 @@ void paramsMqttResetSubscribes()
     // Delete all topics from the heap
     paramsEntryHandle_t item;
     STAILQ_FOREACH(item, paramsList, next) {
+      #if CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
+      free(item->confirm);
+      item->confirm = NULL;
+      #endif // CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
       free(item->topic);
       item->topic = NULL;
     };
@@ -726,6 +749,9 @@ void paramsRegValue(const param_kind_t type_param, const param_type_t type_value
     item->group = name_group;
     item->key = name_key;
     item->topic = NULL;
+    #if CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
+    item->confirm = NULL;
+    #endif // CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
     item->qos = qos;
     item->value = value;
     // Append item to list
@@ -862,12 +888,17 @@ void paramsSetValue(paramsEntryHandle_t entry, uint8_t *payload, size_t len)
       xTaskResumeAll();
       // We save the resulting value in the storage
       nvsWrite(entry->group, entry->key, entry->type_value, entry->value);
+      #if CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
+      char* str_value = value2string(entry->type_value, entry->value);
+      mqttPublish(entry->confirm, str_value, CONFIG_MQTT_CONFIRM_QOS, CONFIG_MQTT_CONFIRM_RETAINED, true, false, false);
+      if (str_value) free(str_value);
+      #endif // CONFIG_MQTT_PARAMS_CONFIRM_ENABLED
       // We send a notification to telegram
       #if CONFIG_TELEGRAM_ENABLE && CONFIG_TELEGRAM_PARAM_CHANGE_NOTIFY
-      char* str_value = value2string(entry->type_value, entry->value);
+      char* tg_value = value2string(entry->type_value, entry->value);
       tgSend(true, CONFIG_TELEGRAM_DEVICE, CONFIG_MESSAGE_TG_PARAM_CHANGE, 
-        entry->friendly, entry->group, entry->key, str_value);
-      if (str_value) free(str_value);
+        entry->friendly, entry->group, entry->key, tg_value);
+      if (tg_value) free(tg_value);
       #endif // CONFIG_TELEGRAM_ENABLE && CONFIG_TELEGRAM_PARAM_CHANGE_NOTIFY
     };
   } else {
