@@ -602,11 +602,6 @@ void mqttOnChangeStatus(esp_mqtt_status_t status)
   };
 }
 
-void mqttOnIncomingMessage(char *topic, uint8_t *payload, size_t len)
-{
-  paramsMqttIncomingMessage(topic, payload, len); 
-}
-
 // -----------------------------------------------------------------------------------------------------------------------
 // --------------------------------------------------- Task routines -----------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
@@ -645,7 +640,7 @@ bool mqttTaskCreate()
 #endif
 {
   if (_mqttTask == NULL) {
-    if (!esp_mqtt_init(mqttOnChangeStatus, mqttOnIncomingMessage)) {
+    if (!esp_mqtt_init(mqttOnChangeStatus, paramsMqttIncomingMessage)) {
       ledSysStateSet(SYSLED_ERROR, false);
       return false;
     };
