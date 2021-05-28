@@ -21,7 +21,6 @@ extern "C" {
 #include "esp_lwmqtt.h"
 #include "esp_mqtt.h"
 
-typedef void (*param_change_callback_t) (); 
 #if CONFIG_SILENT_MODE_ENABLE
 typedef void (*silent_mode_change_callback_t) (const bool silent_mode);
 #endif // CONFIG_SILENT_MODE_ENABLE
@@ -38,12 +37,6 @@ bool mqttTaskDelete();
 bool mqttSubscribe(const char *topic, int qos);
 bool mqttUnsubscribe(const char *topic);
 bool mqttPublish(char *topic, char *payload, int qos, bool retained, bool forced, bool free_topic, bool free_payload);
-
-bool paramsInit();
-void paramsFree();
-void paramsRegValue(const param_kind_t type_param, const param_type_t type_value, param_change_callback_t callback_change,
-  const char* name_group, const char* name_key, const char* name_friendly, const int qos, 
-  void * value);
 
 #if CONFIG_SILENT_MODE_ENABLE
 bool silentMode();
