@@ -59,6 +59,8 @@ StaticTask_t _mqttTaskBuffer;
 StackType_t _mqttTaskStack[CONFIG_MQTT_OUTBOX_STACK_SIZE];
 #endif // CONFIG_MQTT_STATIC_ALLOCATION
 
+minute_timer_callback_t _mintimer_cb = nullptr;
+
 // -----------------------------------------------------------------------------------------------------------------------
 // ---------------------------------------------------- Publish main -----------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
@@ -158,6 +160,8 @@ bool mqttOutboxPublish(mqttOutboxHandle_t outbox)
       };
       return false;
     };
+    // esp_task_wdt_reset();
+    vTaskDelay(0);
   };
   return true;  
 }
@@ -269,56 +273,7 @@ void mqttPublishSysInfo()
 };
 #endif // CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_SYSINFO_ENABLE
 
-#if CONFIG_SILENT_MODE_ENABLE
 
-static uint32_t tsSilentMode = CONFIG_SILENT_MODE_INTERVAL;
-static bool stateSilentMode = false;
-silent_mode_change_callback_t cbSilentMode = NULL;
-static const char* tagSM = "SILENT MODE";
-
-bool silentMode()
-{
-  return stateSilentMode;
-}
-
-void silentModeSetCallback(silent_mode_change_callback_t cb)
-{
-  cbSilentMode = cb;
-}
-
-void silentModeCheck()
-{
-  if (tsSilentMode > 0) {
-    uint16_t t1 = tsSilentMode / 10000;
-    uint16_t t2 = tsSilentMode % 10000;
-    int16_t  t0 = timeinfo.tm_hour * 100 + timeinfo.tm_min;
-    bool newSilentMode = (t1 < t2) ? ((t0 >= t1) && (t0 < t2)) : !((t0 >= t2) && (t1 > t0));
-    // If the regime has changed
-    if (stateSilentMode != newSilentMode) {
-      stateSilentMode = newSilentMode;
-      // Switching the system LED (take care of the rest yourself)  
-      ledSysSetEnabled(!stateSilentMode);
-      // Calling the callback function
-      if (cbSilentMode) {
-        cbSilentMode(stateSilentMode);
-      };
-      // Sending alerts
-      if (stateSilentMode) {
-        rlog_i(tagSM, "Silent mode activated");
-        #if CONFIG_SILENT_MODE_TG_NOTIFY
-        tgSend(CONFIG_SILENT_MODE_TG_MSG_NOTIFY, CONFIG_TELEGRAM_DEVICE, CONFIG_MESSAGE_TG_SILENT_MODE_ON);
-        #endif // CONFIG_SILENT_MODE_TG_NOTIFY
-      } else {
-        rlog_i(tagSM, "Silent mode disabled");
-        #if CONFIG_SILENT_MODE_TG_NOTIFY
-        tgSend(CONFIG_SILENT_MODE_TG_MSG_NOTIFY, CONFIG_TELEGRAM_DEVICE, CONFIG_MESSAGE_TG_SILENT_MODE_OFF);
-        #endif // CONFIG_SILENT_MODE_TG_NOTIFY
-      };
-    };
-  };
-}
-
-#endif // CONFIG_SILENT_MODE_ENABLE
 
 void mqttFixTime()
 {
@@ -388,8 +343,10 @@ void mqttFixTime()
     #endif // CONFIG_MQTT_TIME_ENABLE
 
     #if CONFIG_SILENT_MODE_ENABLE
-    silentModeCheck();
+    silentModeCheck(timeinfo);
     #endif // CONFIG_SILENT_MODE_ENABLE
+
+    if (_mintimer_cb) _mintimer_cb(timeinfo.tm_mday, timeinfo.tm_wday, timeinfo.tm_hour, timeinfo.tm_min);
   };
 }
 
@@ -418,6 +375,16 @@ bool mqttUnsubscribe(const char *topic)
   };
   return ret;
 }
+
+// -----------------------------------------------------------------------------------------------------------------------
+// ----------------------------------------------------- Utilites --------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------
+
+bool mqttIsConnected() 
+{
+  return (_mqttTask) && esp_mqtt_is_connected();
+}
+
 
 // -----------------------------------------------------------------------------------------------------------------------
 // --------------------------------------------------- Outbox Task -------------------------------------------------------
@@ -565,7 +532,7 @@ void mqttOnChangeStatus(esp_mqtt_status_t status)
         mqttConnCnt++;
         ledSysStateClear(SYSLED_MQTT_ERROR, false);
         // Recovering subscriptions for all params
-        paramsMqttSubscribes();
+        paramsMqttSubscribesOpen();
         // We send a notification to Telegram
         #if CONFIG_TELEGRAM_ENABLE && CONFIG_MQTT_STATUS_TG_NOTIFY
           if (mqttConnCnt > 1) tgSend(false, CONFIG_TELEGRAM_DEVICE, CONFIG_MESSAGE_TG_MQTT_CONNECT);
@@ -575,7 +542,7 @@ void mqttOnChangeStatus(esp_mqtt_status_t status)
       case ESP_MQTT_STATUS_DISCONNECTED:
         ledSysStateSet(SYSLED_MQTT_ERROR, false);
         // Resetting the subscriptions of all params
-        paramsMqttResetSubscribes();
+        paramsMqttSubscribesClose();
         // We send a notification to Telegram
         #if CONFIG_TELEGRAM_ENABLE && CONFIG_MQTT_STATUS_TG_NOTIFY
           tgSend(true, CONFIG_TELEGRAM_DEVICE, CONFIG_MESSAGE_TG_MQTT_DISCONNECT, esp_mqtt_last_error(), esp_mqtt_last_error_str());
@@ -608,7 +575,7 @@ void mqttOnChangeStatus(esp_mqtt_status_t status)
 
 bool mqttTaskSuspend()
 {
-  if ((_mqttTask != NULL) && (eTaskGetState(_mqttTask) != eSuspended)) {
+  if ((_mqttTask) && (eTaskGetState(_mqttTask) != eSuspended)) {
     esp_mqtt_stop();
     vTaskSuspend(_mqttTask);
     rloga_d("Task [ %s ] has been successfully suspended", mqttTaskName);
@@ -622,7 +589,7 @@ bool mqttTaskSuspend()
 
 bool mqttTaskResume()
 {
-  if ((_mqttTask != NULL) && (eTaskGetState(_mqttTask) == eSuspended)) {
+  if ((_mqttTask) && (eTaskGetState(_mqttTask) == eSuspended)) {
     vTaskResume(_mqttTask);
     rloga_d("Task [ %s ] has been successfully started", mqttTaskName);
     if (esp_mqtt_start()) {
@@ -639,7 +606,7 @@ bool mqttTaskCreate(bool enable, bool verify, const uint8_t *ca_buf, size_t ca_l
 bool mqttTaskCreate() 
 #endif
 {
-  if (_mqttTask == NULL) {
+  if (!_mqttTask) {
     if (!esp_mqtt_init(mqttOnChangeStatus, paramsMqttIncomingMessage)) {
       ledSysStateSet(SYSLED_ERROR, false);
       return false;

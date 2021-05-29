@@ -14,16 +14,14 @@
 #include "project_config.h"
 #include "rTypes.h"
 
+typedef void (*minute_timer_callback_t) (const uint8_t mday, const uint8_t wday, const uint8_t hour, const uint8_t min); 
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #include "esp_lwmqtt.h"
 #include "esp_mqtt.h"
-
-#if CONFIG_SILENT_MODE_ENABLE
-typedef void (*silent_mode_change_callback_t) (const bool silent_mode);
-#endif // CONFIG_SILENT_MODE_ENABLE
 
 #if CONFIG_MQTT_TLS_ENABLE
 bool mqttTaskCreate(bool enable, bool verify, const uint8_t *ca_buf, size_t ca_len);
@@ -34,14 +32,10 @@ bool mqttTaskSuspend();
 bool mqttTaskResume();
 bool mqttTaskDelete();
 
+bool mqttIsConnected();
 bool mqttSubscribe(const char *topic, int qos);
 bool mqttUnsubscribe(const char *topic);
 bool mqttPublish(char *topic, char *payload, int qos, bool retained, bool forced, bool free_topic, bool free_payload);
-
-#if CONFIG_SILENT_MODE_ENABLE
-bool silentMode();
-void silentModeSetCallback(silent_mode_change_callback_t cb);
-#endif // CONFIG_SILENT_MODE_ENABLE
 
 #ifdef __cplusplus
 }
