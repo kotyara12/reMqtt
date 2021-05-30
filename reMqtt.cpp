@@ -15,6 +15,7 @@
 #include <freertos/task.h>
 #include <string.h>
 #include <time.h>
+#include "esp_task_wdt.h"
 #include "sys/queue.h"
 extern "C" {
 #include "esp_mqtt.h"
@@ -161,7 +162,8 @@ bool mqttOutboxPublish(mqttOutboxHandle_t outbox)
       return false;
     };
     // esp_task_wdt_reset();
-    vTaskDelay(0);
+    // taskYIELD();
+    vTaskDelay(1);
   };
   return true;  
 }
@@ -293,8 +295,6 @@ void mqttPublishSysInfo()
   };
 };
 #endif // CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_SYSINFO_ENABLE
-
-
 
 void mqttFixTime()
 {
