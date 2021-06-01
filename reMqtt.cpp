@@ -81,12 +81,14 @@ bool mqttPublish(char *topic, char *payload, int qos, bool retained, bool forced
     mqttMsg->free_payload = free_payload;
     STAILQ_NEXT(mqttMsg, next) = NULL;
     
-    // Add a message to the publish queue
-    if (xQueueSend(_mqttQueue, &mqttMsg, CONFIG_MQTT_OUTBOX_QUEUE_WAIT / portTICK_PERIOD_MS) == pdPASS) {
+    // Add a message to the publish queue (three attempts)
+    if ((xQueueSend(_mqttQueue, &mqttMsg, CONFIG_MQTT_OUTBOX_QUEUE_WAIT / portTICK_PERIOD_MS) == pdPASS)
+     || (xQueueSend(_mqttQueue, &mqttMsg, CONFIG_MQTT_OUTBOX_QUEUE_WAIT / portTICK_PERIOD_MS) == pdPASS)
+     || (xQueueSend(_mqttQueue, &mqttMsg, CONFIG_MQTT_OUTBOX_QUEUE_WAIT / portTICK_PERIOD_MS) == pdPASS)) {
       rlog_v(tagMQTTQ, "Message \"%s\" [ %s ] successfully added the queue", topic, payload);
       return true;
     } else {
-      rlog_e(tagMQTTQ, "Error adding message to queue [ %s ]!", mqttTaskName);
+      rlog_e(tagMQTTQ, "Error adding message to queue [ %s ], topic  [ %s ]!", mqttTaskName, topic);
       ledSysStateSet(SYSLED_MQTT_ERROR, false);
       // Removing a message from heap
       if (mqttMsg->free_payload) free(mqttMsg->payload);
