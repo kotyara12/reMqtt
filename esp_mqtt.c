@@ -11,6 +11,7 @@
 #include "esp_tls_lwmqtt.h"
 #endif
 #include "esp_lwmqtt.h"
+#include "esp_task_wdt.h"
 
 static const char* tagMQTT = "MQTT";
 static const char* mqttTaskName = "mqttClient";
@@ -454,6 +455,8 @@ void esp_mqtt_task_exec(void *pvParameters)
         break;
       };
 
+      vTaskDelay(1);
+
       // acquire select mutex
       ESP_MQTT_LOCK_SELECT();
 
@@ -543,6 +546,8 @@ void esp_mqtt_task_exec(void *pvParameters)
 
       // dispatch queued events
       esp_mqtt_dispatch_events();
+
+      esp_task_wdt_reset();
     };
 
     // close connection
