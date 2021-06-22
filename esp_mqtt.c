@@ -258,15 +258,31 @@ static bool esp_mqtt_process_connect()
   lwmqtt_set_callback(&esp_mqtt_client, NULL, esp_mqtt_message_handler);
 
   // initiate network connection
-  #if CONFIG_MQTT_TLS_ENABLE
-    if (esp_mqtt_use_tls) {
-      esp_mqtt_error = esp_tls_lwmqtt_network_connect(&esp_mqtt_tls_network, CONFIG_MQTT_HOST, CONFIG_MQTT_PORT_TLS);
-    } else {
-      esp_mqtt_error = esp_lwmqtt_network_connect(&esp_mqtt_network, CONFIG_MQTT_HOST, CONFIG_MQTT_PORT_TCP);
-    }
+  #if CONFIG_MQTT_GATEWAY
+    char * s_gw_ip = wifiGetGatewayIP();
+    if (s_gw_ip) {
+      #if CONFIG_MQTT_TLS_ENABLE
+        if (esp_mqtt_use_tls) {
+          esp_mqtt_error = esp_tls_lwmqtt_network_connect(&esp_mqtt_tls_network, s_gw_ip, CONFIG_MQTT_PORT_TLS);
+        } else {
+          esp_mqtt_error = esp_lwmqtt_network_connect(&esp_mqtt_network, s_gw_ip, CONFIG_MQTT_PORT_TCP);
+        }
+      #else
+        esp_mqtt_error = esp_lwmqtt_network_connect(&esp_mqtt_network, s_gw_ip, CONFIG_MQTT_PORT_TCP);
+      #endif // CONFIG_MQTT_TLS_ENABLE
+      free(s_gw_ip);
+    };
   #else
-    esp_mqtt_error = esp_lwmqtt_network_connect(&esp_mqtt_network, CONFIG_MQTT_HOST, CONFIG_MQTT_PORT_TCP);
-  #endif // CONFIG_MQTT_TLS_ENABLE
+    #if CONFIG_MQTT_TLS_ENABLE
+      if (esp_mqtt_use_tls) {
+        esp_mqtt_error = esp_tls_lwmqtt_network_connect(&esp_mqtt_tls_network, CONFIG_MQTT_HOST, CONFIG_MQTT_PORT_TLS);
+      } else {
+        esp_mqtt_error = esp_lwmqtt_network_connect(&esp_mqtt_network, CONFIG_MQTT_HOST, CONFIG_MQTT_PORT_TCP);
+      }
+    #else
+      esp_mqtt_error = esp_lwmqtt_network_connect(&esp_mqtt_network, CONFIG_MQTT_HOST, CONFIG_MQTT_PORT_TCP);
+    #endif // CONFIG_MQTT_TLS_ENABLE
+  #endif // CONFIG_MQTT_GATEWAY
 
   if (esp_mqtt_error != LWMQTT_SUCCESS) {
     rlog_e(tagMQTT, "Failed to connect to MQTT server: {network connect} :: #%d ( %s )", 
