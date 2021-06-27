@@ -88,7 +88,7 @@ bool mqttPublish(char *topic, char *payload, int qos, bool retained, bool forced
       rlog_v(tagMQTTQ, "Message \"%s\" [ %s ] successfully added the queue", topic, payload);
       return true;
     } else {
-      rlog_e(tagMQTTQ, "Error adding message to queue [ %s ], topic  [ %s ]!", mqttTaskName, topic);
+      rlog_e(tagMQTTQ, "Error adding message to queue [ %s ], topic [ %s ]!", mqttTaskName, topic);
       ledSysStateSet(SYSLED_MQTT_ERROR, false);
       // Removing a message from heap
       if (mqttMsg->free_payload) free(mqttMsg->payload);
