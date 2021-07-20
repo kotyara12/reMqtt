@@ -88,6 +88,7 @@ static const char * lwmqtt_err_names[] = {
 
 static const char * lwmqtt_return_code_names[] = {
   "CONNECTION ACCEPTED", 
+  "UNACCEPTABLE PROTOCOL",
   "IDENTIFIER REJECTED",
   "SERVER UNAVAILABLE",
   "BAD USERNAME OR PASSWORD",
@@ -260,6 +261,7 @@ static bool esp_mqtt_process_connect()
   // initiate network connection
   #if CONFIG_MQTT_GATEWAY
     char * s_gw_ip = wifiGetGatewayIP();
+    rlog_i(tagMQTT, "Use gateway as MQTT server: %s", s_gw_ip);
     if (s_gw_ip) {
       #if CONFIG_MQTT_TLS_ENABLE
         if (esp_mqtt_use_tls) {
