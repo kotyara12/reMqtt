@@ -1,7 +1,7 @@
 {
   "name": "reMqtt",
-  "version": "2.0.0",
-  "description": "MQTT client for ESP32 (ESP-IDF) with outbound send queue (for servers with call intervals)",
+  "version": "3.0.0",
+  "description": "MQTT client for ESP32 - wrapper for mqtt_client.h",
   "keywords": "mqtt",
   "authors":
   [

@@ -12,22 +12,14 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "project_config.h"
+#include "mqtt_client.h"
 #include "rTypes.h"
-
-typedef void (*minute_timer_callback_t) (const uint8_t mday, const uint8_t wday, const uint8_t hour, const uint8_t min); 
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "esp_lwmqtt.h"
-#include "esp_mqtt.h"
-
-#if CONFIG_MQTT_TLS_ENABLE
-bool mqttTaskCreate(bool enable, bool verify, const uint8_t *ca_buf, size_t ca_len);
-#else
 bool mqttTaskCreate();
-#endif // CONFIG_MQTT_TLS_ENABLE
 bool mqttTaskSuspend();
 bool mqttTaskResume();
 bool mqttTaskDelete();
