@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "project_config.h"
+#include "esp_event_base.h"
 #include "mqtt_client.h"
 #include "rTypes.h"
 
@@ -19,10 +20,18 @@
 extern "C" {
 #endif
 
-bool mqttTaskCreate();
+#if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
+char* mqttTopicStatusCreate(const bool primary);
+char* mqttTopicStatusGet();
+void  mqttTopicStatusFree();
+#endif // CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
+
+bool mqttTaskStart(bool createSuspended);
+bool mqttTaskStop();
 bool mqttTaskSuspend();
 bool mqttTaskResume();
-bool mqttTaskDelete();
+
+bool mqttEventHandlerRegister();
 
 bool mqttIsConnected();
 bool mqttSubscribe(const char *topic, int qos);

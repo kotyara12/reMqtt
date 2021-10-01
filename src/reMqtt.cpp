@@ -2,79 +2,45 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
-#include "rStrings.h"
+#include <string.h>
 #include "rLog.h"
+#include "rStrings.h"
+#include "reEvents.h"
 #include "reEsp32.h"
 #include "reWifi.h"
 #include "reMqtt.h"
 #include "reNvs.h"
-#include "reParams.h"
-#include "reLedSys.h"
 #include "project_config.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <string.h>
 #include <time.h>
-#if CONFIG_TELEGRAM_ENABLE
-#include "reTgSend.h"
-#endif // CONFIG_TELEGRAM_ENABLE
 
-static const char* tagMQTT = "MQTT";
+static const char* logTAG = "MQTT";
 
 #define MQTT_LOG_PAYLOAD_LIMIT 2048
 
-#if CONFIG_MQTT_TLS_ENABLE
-extern const uint8_t mqtt_broker_pem_start[] asm(CONFIG_MQTT_TLS_PEM_START);
-extern const uint8_t mqtt_broker_pem_end[]   asm(CONFIG_MQTT_TLS_PEM_END); 
-#endif // CONFIG_MQTT_TLS_ENABLE
+#if defined(CONFIG_MQTT1_TYPE) & defined(CONFIG_MQTT1_TLS_ENABLED) & CONFIG_MQTT1_TLS_ENABLED
+extern const uint8_t mqtt1_broker_pem_start[] asm(CONFIG_MQTT1_TLS_PEM_START);
+extern const uint8_t mqtt1_broker_pem_end[]   asm(CONFIG_MQTT1_TLS_PEM_END); 
+#endif // CONFIG_MQTT1_TLS_ENABLED
+#if defined(CONFIG_MQTT2_TYPE) & defined(CONFIG_MQTT2_TLS_ENABLED) & CONFIG_MQTT2_TLS_ENABLED
+extern const uint8_t mqtt2_broker_pem_start[] asm(CONFIG_MQTT2_TLS_PEM_START);
+extern const uint8_t mqtt2_broker_pem_end[]   asm(CONFIG_MQTT2_TLS_PEM_END); 
+#endif // CONFIG_MQTT2_TLS_ENABLED
+
+typedef enum {
+  MQTT_CLIENT_STOPPED   = 0,
+  MQTT_CLIENT_STARTED   = 1,
+  MQTT_CLIENT_SUSPENDED = 2
+} mqtt_client_state_t;
 
 static esp_mqtt_client_handle_t _mqttClient = nullptr;
-static bool _mqttConnected = false;
-static uint32_t _mqttConnCnt = 0;
-
-#ifdef CONFIG_MQTT_STATUS_LWT
-static char* _mqttStatusTopic = nullptr;
-#endif // CONFIG_MQTT_STATUS_LWT
-
-// -----------------------------------------------------------------------------------------------------------------------
-// ----------------------------------------------------- Subscribe -------------------------------------------------------
-// -----------------------------------------------------------------------------------------------------------------------
-
-bool mqttSubscribe(const char *topic, int qos)
-{
-  if (_mqttConnected) {
-    ledSysOn(true);
-    int msq_id = esp_mqtt_client_subscribe(_mqttClient, topic, qos);
-    ledSysOff(true);
-    if (msq_id == -1) {
-      rlog_e(tagMQTT, "Failed to subscribe to topic [%s]!", topic);
-      ledSysStateSet(SYSLED_MQTT_ERROR, false);
-      return false;
-    };
-    return true;
-  };
-  rlog_e(tagMQTT, "Client is not connected!");
-  ledSysStateSet(SYSLED_MQTT_ERROR, false);
-  return false;
-}
-
-bool mqttUnsubscribe(const char *topic)
-{
-  if (_mqttConnected) {
-    ledSysOn(true);
-    int msq_id = esp_mqtt_client_unsubscribe(_mqttClient, topic);
-    ledSysOff(true);
-    if (msq_id == -1) {
-      rlog_e(tagMQTT, "Failed to unsubscribe from topic [%s]!", topic);
-      ledSysStateSet(SYSLED_MQTT_ERROR, false);
-      return false;
-    };
-    return true;
-  };
-  rlog_e(tagMQTT, "Client is not connected!");
-  ledSysStateSet(SYSLED_MQTT_ERROR, false);
-  return false;
-}
+static re_mqtt_event_data_t _mqttData;
+static mqtt_client_state_t _mqttState = MQTT_CLIENT_STOPPED;
+static bool _mqttError = false;
+#if CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES && CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0
+static uint32_t _mqttBackToPrimarty = 0;
+#endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
 
 // -----------------------------------------------------------------------------------------------------------------------
 // ----------------------------------------------------- Utilites --------------------------------------------------------
@@ -82,7 +48,298 @@ bool mqttUnsubscribe(const char *topic)
 
 bool mqttIsConnected() 
 {
-  return wifiIsConnected() && _mqttConnected;
+  return wifiIsConnected() && _mqttData.connected;
+}
+
+void mqttErrorEventSend(char* message)
+{
+  _mqttError = true;
+  if (message) {
+    eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR, (void*)message, strlen(message)+1, portMAX_DELAY);
+  } else {
+    eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR, nullptr, 0, portMAX_DELAY);
+  };
+  
+}
+
+void mqttErrorEventClear()
+{
+  if (_mqttError) {
+    _mqttError = false;
+    eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR_CLEAR, nullptr, 0, portMAX_DELAY);
+  };
+}
+
+// -----------------------------------------------------------------------------------------------------------------------
+// ------------------------------------------------ Publish system status ------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------
+
+#if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
+
+static char* _mqttTopicStatus = NULL;
+
+char* mqttTopicStatusCreate(const bool primary)
+{
+  if (_mqttTopicStatus) free(_mqttTopicStatus);
+  _mqttTopicStatus = mqttGetTopic1(primary, CONFIG_MQTT_STATUS_LOCAL, CONFIG_MQTT_STATUS_TOPIC);
+  rlog_i(logTAG, "Generated topic for publishing system status: [ %s ]", _mqttTopicStatus);
+  return _mqttTopicStatus;
+}
+
+char* mqttTopicStatusGet()
+{
+  if (!_mqttTopicStatus) {
+    if (_mqttData.connected) {
+      mqttTopicStatusCreate(_mqttData.primary);
+    };
+  };
+  return _mqttTopicStatus;
+}
+
+void mqttTopicStatusFree()
+{
+  if (_mqttTopicStatus) free(_mqttTopicStatus);
+  _mqttTopicStatus = nullptr;
+  rlog_d(logTAG, "Topic for publishing system status has been scrapped");
+}
+
+#endif // CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
+
+// -----------------------------------------------------------------------------------------------------------------------
+// -------------------------------------------------- Server selection ---------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------
+
+bool mqttStart();
+
+static bool _mqttInternetAvailable = false;
+static bool _mqttServer1Available = true;
+
+bool mqttServer1isLocal()
+{
+  return CONFIG_MQTT1_TYPE > 0;
+}
+
+bool mqttServer1Enabled()
+{
+  return _mqttServer1Available && (_mqttInternetAvailable || mqttServer1isLocal());
+}
+
+#ifdef CONFIG_MQTT2_TYPE
+
+static bool _mqttPrimary = true;
+static bool _mqttServer2Available = true;
+static time_t _mqttServer2Activate = 0;
+
+bool mqttServer2isLocal()
+{
+  return CONFIG_MQTT2_TYPE > 0;
+}
+
+bool mqttServer2Enabled()
+{
+  return _mqttServer2Available && (_mqttInternetAvailable || mqttServer2isLocal());
+}
+
+#if CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES && CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0
+static void mqttTimeEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
+#endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
+
+bool mqttServer1Start()
+{
+  _mqttPrimary = true;
+  _mqttServer2Activate = 0;
+  rlog_i(logTAG, "Primary MQTT broker selected");
+  #if CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES && CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0
+    _mqttBackToPrimarty = 0;
+    eventHandlerUnregister(RE_TIME_EVENTS, RE_TIME_EVERY_MINUTE, &mqttTimeEventHandler);
+  #endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
+  return mqttStart();
+}
+
+bool mqttServer2Start()
+{
+  _mqttPrimary = false;
+  _mqttServer2Activate = time(nullptr);
+  rlog_i(logTAG, "Reserved MQTT broker selected");
+  #if CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES && CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0
+    _mqttBackToPrimarty = 0;
+    eventHandlerRegister(RE_TIME_EVENTS, RE_TIME_EVERY_MINUTE, &mqttTimeEventHandler, nullptr);
+  #endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
+  return mqttStart();
+}
+
+bool mqttServer1Select()
+{
+  _mqttPrimary = true;
+  _mqttServer2Activate = 0;
+  rlog_w(logTAG, "Switching to primary MQTT broker");
+  #if CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES && CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0
+    _mqttBackToPrimarty = 0;
+    eventHandlerUnregister(RE_TIME_EVENTS, RE_TIME_EVERY_MINUTE, &mqttTimeEventHandler);
+  #endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
+  return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SERVER_PRIMARY, nullptr, 0, portMAX_DELAY);
+}
+
+bool mqttServer2Select()
+{
+  _mqttPrimary = false;
+  _mqttServer2Activate = time(nullptr);
+  rlog_w(logTAG, "Switching to reserved MQTT broker");
+  #if CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES && CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0
+    _mqttBackToPrimarty = 0;
+    eventHandlerRegister(RE_TIME_EVENTS, RE_TIME_EVERY_MINUTE, &mqttTimeEventHandler, nullptr);
+  #endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
+  return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, nullptr, 0, portMAX_DELAY);
+}
+
+bool mqttServer1Acivate()
+{
+  switch (_mqttState) {
+    case MQTT_CLIENT_STOPPED:
+      return mqttServer1Start();
+      break;
+    case MQTT_CLIENT_STARTED:
+      if (!_mqttPrimary) {
+        return mqttServer1Select();
+      };
+      break;
+    case MQTT_CLIENT_SUSPENDED:
+      if (_mqttPrimary) {
+        return mqttTaskResume();
+      } else {
+        return mqttServer1Select();
+      };
+      break;
+  };
+  return false;
+}
+
+bool mqttServer2Acivate()
+{
+  switch (_mqttState) {
+    case MQTT_CLIENT_STOPPED:
+      return mqttServer2Start();
+      break;
+    case MQTT_CLIENT_STARTED:
+      if (_mqttPrimary) {
+        return mqttServer2Select();
+      };
+      break;
+    case MQTT_CLIENT_SUSPENDED:
+      if (!_mqttPrimary) {
+        return mqttTaskResume();
+      } else {
+        return mqttServer2Select();
+      };
+      break;
+  };
+  return false;
+}
+
+// Setting network availability and starting the client, depending on which server is currently available
+bool mqttServerSelectAuto()
+{
+  if (mqttServer1Enabled()) {
+    return mqttServer1Acivate();
+  } else {
+    if (mqttServer2Enabled()) {
+      return mqttServer2Acivate();
+    } else {
+      if (_mqttState == MQTT_CLIENT_STARTED) {
+        return mqttTaskSuspend();
+      };
+    };
+  };
+  return false;
+}
+
+// Server status change (by ping)
+bool mqttServer2SetAvailable(const bool newAvailable)
+{
+  if (_mqttServer2Available != newAvailable) {
+    _mqttServer2Available = newAvailable;
+    return mqttServerSelectAuto();
+  };
+  return false;
+}
+
+#else
+
+bool mqttServerSelectAuto()
+{
+  if (mqttServer1Enabled()) {
+    switch (_mqttState) {
+      case MQTT_CLIENT_STOPPED:
+        return mqttStart();
+      case MQTT_CLIENT_STARTED:
+        return false;
+      case MQTT_CLIENT_SUSPENDED:
+        return mqttTaskResume();
+    };
+  } else {
+    if (_mqttState == MQTT_CLIENT_STARTED) {
+      return mqttTaskSuspend();
+    };
+  };
+  return false;
+}
+
+#endif // CONFIG_MQTT2_TYPE
+
+// Server status change (by ping)
+bool mqttServer1SetAvailable(const bool newAvailable)
+{
+  if (_mqttServer1Available != newAvailable) {
+    _mqttServer1Available = newAvailable;
+    return mqttServerSelectAuto();
+  };
+  return false;
+}
+
+// Server status change (by internet)
+bool mqttServerSelectInet(const bool internetAvailable)
+{
+  if (_mqttInternetAvailable != internetAvailable) {
+    _mqttInternetAvailable = internetAvailable;
+    return mqttServerSelectAuto();
+  };
+  return false;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------
+// ----------------------------------------------------- Subscribe -------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------
+
+bool mqttSubscribe(const char *topic, int qos)
+{
+  if (_mqttData.connected) {
+    eventLoopPostSystem(RE_SYS_SYSLED, RE_SYS_FLASH);
+    int msg_id = esp_mqtt_client_subscribe(_mqttClient, topic, qos);
+    if (msg_id == -1) {
+      rlog_e(logTAG, "Failed to subscribe to topic \"%s\"!", topic);
+      mqttErrorEventSend(nullptr);
+      return false;
+    };
+    rlog_i(logTAG, "Subscribed to: \"%s\"", topic);
+    return true;
+  };
+  return false;
+}
+
+bool mqttUnsubscribe(const char *topic)
+{
+  if (_mqttData.connected) {
+    eventLoopPostSystem(RE_SYS_SYSLED, RE_SYS_FLASH);
+    int msg_id = esp_mqtt_client_unsubscribe(_mqttClient, topic);
+    if (msg_id == -1) {
+      rlog_e(logTAG, "Failed to unsubscribe from topic \"%s\"!", topic);
+      mqttErrorEventSend(nullptr);
+      return false;
+    };
+    rlog_i(logTAG, "Unsubscribed from: \"%s\"", topic);
+    return true;
+  };
+  return false;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------
@@ -91,527 +348,380 @@ bool mqttIsConnected()
 
 bool mqttPublish(char *topic, char *payload, int qos, bool retained, bool forced, bool free_topic, bool free_payload)
 {
-  if (_mqttConnected) {
-    return true;
-  };
-  rlog_e(tagMQTT, "Client is not connected!");
-  ledSysStateSet(SYSLED_MQTT_ERROR, false);
-  return false;
-}
-
-// -----------------------------------------------------------------------------------------------------------------------
-// ------------------------------------------------- Publish Date & Time -------------------------------------------------
-// -----------------------------------------------------------------------------------------------------------------------
-
-/*
-static struct tm timeinfo; 
-static uint32_t w_days = 0;
-static uint8_t w_hours = 0;
-static uint8_t w_mins = -1;
-static char s_time[10];
-static char s_date[12];
-static char s_wday[12];
-static char s_timeday[32];
-static char s_datetime1[32];
-static char s_datetime2[48];
-
-#if CONFIG_MQTT_TIME_ENABLE
-
-static char* _mqttTopicTime = NULL;
-
-void mqttPublishTime()
-{
-  // rlog_d(tagMQTTQ, "Date and time publishing...");
-  
-  #if CONFIG_MQTT_TIME_AS_PLAIN
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "time"), s_time, CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, false);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "date"), s_date, CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, false);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "weekday"), s_wday, CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, false);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "timeday"), s_timeday, CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, false);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "datetime1"), s_datetime1, CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, false);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "datetime2"), s_datetime2, CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, false);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "year"), malloc_stringf("%d", timeinfo.tm_year+1900), CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, true);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "month"), malloc_stringf("%d", timeinfo.tm_mon), CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, true);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "day"), malloc_stringf("%d", timeinfo.tm_mday), CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, true);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "hour"), malloc_stringf("%d", timeinfo.tm_hour), CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, true);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "min"), malloc_stringf("%d", timeinfo.tm_min), CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, true);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "wday"), malloc_stringf("%d", timeinfo.tm_wday), CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, true);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "yday"), malloc_stringf("%d", timeinfo.tm_yday), CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, true);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "worktime/days"), malloc_stringf("%d", w_days), CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, true);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "worktime/hours"), malloc_stringf("%d", w_hours), CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, true);
-    mqttPublish(mqttGetSubTopic(_mqttTopicTime, "worktime/minutes"), malloc_stringf("%d", w_mins), CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, true, true);
-  #endif // CONFIG_MQTT_TIME_AS_PLAIN
-
-  #if CONFIG_MQTT_TIME_AS_JSON
-    char * json = malloc_stringf("{\"time\":\"%s\",\"date\":\"%s\",\"weekday\":\"%s\",\"timeday\":\"%s\",\"datetime1\":\"%s\",\"datetime2\":\"%s\",\"year\":%d,\"month\":%d,\"day\":%d,\"hour\":%d,\"min\":%d,\"wday\":%d,\"yday\":%d,\"worktime\":{\"days\":%d,\"hours\":%d,\"minutes\":%d}}", 
-      s_time, s_date,  s_wday, s_timeday, s_datetime1, s_datetime2, 
-      timeinfo.tm_year+1900, timeinfo.tm_mon, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_wday, timeinfo.tm_yday,
-      w_days, w_hours, w_mins);
-    if (json) mqttPublish(_mqttTopicTime, json, CONFIG_MQTT_TIME_QOS, CONFIG_MQTT_TIME_RETAINED, true, false, true);
-  #endif // CONFIG_MQTT_TIME_AS_JSON
-};
-#endif // CONFIG_MQTT_TIME_ENABLE
-
-#if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
-static char* _mqttTopicStatus = NULL;
-#endif // CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
-
-#if CONFIG_MQTT_SYSINFO_ENABLE
-static char* _mqttTopicSysInfo = NULL;
-#endif // CONFIG_MQTT_SYSINFO_ENABLE
-
-#if CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_SYSINFO_ENABLE
-void mqttPublishSysInfo()
-{
-  // rlog_d(tagMQTTQ, "System information publishing...");
-  
-  double heap_total = (double)heap_caps_get_total_size(MALLOC_CAP_DEFAULT) / 1024.0;
-  double heap_free  = (double)heap_caps_get_free_size(MALLOC_CAP_DEFAULT) / 1024.0;
-  double heap_min   = (double)heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT) / 1024.0;
-  wifi_ap_record_t wifi_info = wifiInfo();
-  esp_netif_ip_info_t wifi_ip = wifiLocalIP();
-  uint8_t * ip = (uint8_t*)&(wifi_ip.ip);
-  uint8_t * mask = (uint8_t*)&(wifi_ip.netmask);
-  uint8_t * gw = (uint8_t*)&(wifi_ip.gw);
-
-  char * s_status = malloc_stringf("%.2d : %.2d : %.2d\nRSSI: %d dBi\n%.1fKb %.0f%%",
-    w_days, w_hours, w_mins, wifi_info.rssi, heap_free, 100.0*heap_free/heap_total);
-    
-  if (s_status) {
-    #if CONFIG_MQTT_STATUS_ONLINE
-      #if CONFIG_MQTT_STATUS_ONLINE_PAYLOAD_SYSINFO
-        mqttPublish(_mqttTopicStatus, malloc_stringf("%s", s_status), 
-          CONFIG_MQTT_STATUS_QOS, CONFIG_MQTT_STATUS_RETAINED, true, false, true);
-      #else
-        mqttPublish(_mqttTopicStatus, (char*)CONFIG_MQTT_STATUS_ONLINE_PAYLOAD, 
-          CONFIG_MQTT_STATUS_QOS, CONFIG_MQTT_STATUS_RETAINED, true, false, false);
-      #endif // CONFIG_MQTT_STATUS_ONLINE_PAYLOAD_SYSINFO
-    #endif // CONFIG_MQTT_STATUS_ONLINE
-    
-    #if CONFIG_MQTT_SYSINFO_ENABLE
-      char * s_wifi = malloc_stringf("{\"ssid\":\"%s\",\"rssi\":%d,\"ip\":\"%d.%d.%d.%d\",\"mask\":\"%d.%d.%d.%d\",\"gw\":\"%d.%d.%d.%d\"}",
-        wifi_info.ssid, wifi_info.rssi,
-        ip[0], ip[1], ip[2], ip[3], mask[0], mask[1], mask[2], mask[3], gw[0], gw[1], gw[2], gw[3]);
-      char * s_work = malloc_stringf("{\"days\":%d,\"hours\":%d,\"minutes\":%d}",
-        w_days, w_hours, w_mins);
-      char * s_heap = malloc_stringf("{\"total\":\"%.1f\",\"free\":\"%.1f\",\"free_percents\":\"%.0f\",\"free_min\":\"%.1f\",\"free_min_percents\":\"%.0f\"}",
-        heap_total, heap_free, 100.0*heap_free/heap_total, heap_min, 100.0*heap_min/heap_total);
-      
-      if ((s_wifi) && (s_work) && (s_heap) && (s_status)) {
-        char * json = malloc_stringf("{\"firmware\":\"%s\",\"wifi\":%s,\"worktime\":%s,\"heap\":%s,\"summary\":\"%s\"}", 
-          APP_VERSION, s_wifi, s_work, s_heap, s_status);
-        if (json) mqttPublish(_mqttTopicSysInfo, json, 
-          CONFIG_MQTT_SYSINFO_QOS, CONFIG_MQTT_SYSINFO_RETAINED, false, false, true);
+  if ((topic) && (_mqttData.connected)) {
+    int msg_id;
+    eventLoopPostSystem(RE_SYS_SYSLED, RE_SYS_FLASH);
+    if (payload) {
+      if (forced) {
+        msg_id = esp_mqtt_client_publish(_mqttClient, topic, payload, strlen(payload), qos, retained);
+      } else {
+        msg_id = esp_mqtt_client_enqueue(_mqttClient, topic, payload, strlen(payload), qos, retained, true);
       };
-
-      if (s_heap) free(s_heap);
-      if (s_work) free(s_work);
-      if (s_wifi) free(s_wifi);
-    #endif // CONFIG_MQTT_SYSINFO_ENABLE
-
-    free(s_status);
-  };
-};
-#endif // CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_SYSINFO_ENABLE
-
-void mqttFixTime()
-{
-  static time_t now;
-  static uint8_t prev_min = 255;
-
-  // We get the current time
-  now = time(NULL);
-  localtime_r(&now, &timeinfo);
-
-  // We perform actions only when the minute changes
-  if ((timeinfo.tm_year > 70) && (timeinfo.tm_min != prev_min)) {
-    prev_min = timeinfo.tm_min;
-
-    // Preparation date and time strings
-    strftime(s_time, sizeof(s_time), CONFIG_FORMAT_TIME, &timeinfo);
-    strftime(s_date, sizeof(s_date), CONFIG_FORMAT_DATE, &timeinfo);
-    switch (timeinfo.tm_wday) {
-    case 1:
-      strcpy(s_wday, CONFIG_FORMAT_WDAY1);
-      break;
-    case 2:
-      strcpy(s_wday, CONFIG_FORMAT_WDAY2);
-      break;
-    case 3:
-      strcpy(s_wday, CONFIG_FORMAT_WDAY3);
-      break;
-    case 4:
-      strcpy(s_wday, CONFIG_FORMAT_WDAY4);
-      break;
-    case 5:
-      strcpy(s_wday, CONFIG_FORMAT_WDAY5);
-      break;
-    case 6:
-      strcpy(s_wday, CONFIG_FORMAT_WDAY6);
-      break;
-    case 0:
-      strcpy(s_wday, CONFIG_FORMAT_WDAY7);
-      break;
-    };
-    #if CONFIG_FORMAT_WT
-      snprintf(s_timeday, sizeof(s_timeday), CONFIG_FORMAT_TIMEDAY, s_wday, s_time);
-    #else
-      snprintf(s_timeday, sizeof(s_timeday), CONFIG_FORMAT_TIMEDAY, s_time, s_wday);
-    #endif // CONFIG_FORMAT_WTD
-    #if CONFIG_FORMAT_TD
-      snprintf(s_datetime1, sizeof(s_datetime1), CONFIG_FORMAT_DATETIME1, s_time, s_date);
-      snprintf(s_datetime2, sizeof(s_datetime2), CONFIG_FORMAT_DATETIME2, s_timeday, s_date);
-    #else 
-      snprintf(s_datetime1, sizeof(s_datetime1), CONFIG_FORMAT_DATETIME1, s_date, s_time);
-      snprintf(s_datetime2, sizeof(s_datetime2), CONFIG_FORMAT_DATETIME2, s_date, s_timeday);
-    #endif // CONFIG_FORMAT_TD
-
-    // We count the amount of time worked
-    w_mins++;
-    if (w_mins > 59) {
-      w_mins = 0;
-      w_hours++;
-      if (w_hours > 23) {
-        w_hours = 0;
-        w_days++;
-      };
-    };
-
-    #if CONFIG_MQTT_TIME_ENABLE
-    mqttPublishTime();
-    #endif // CONFIG_MQTT_TIME_ENABLE
-
-    #if CONFIG_SILENT_MODE_ENABLE
-    silentModeCheck(timeinfo);
-    #endif // CONFIG_SILENT_MODE_ENABLE
-
-    if (_mintimer_cb) _mintimer_cb(timeinfo.tm_mday, timeinfo.tm_wday, timeinfo.tm_hour, timeinfo.tm_min);
-  };
-}
-*/
-
-// -----------------------------------------------------------------------------------------------------------------------
-// --------------------------------------------------- Outbox Task -------------------------------------------------------
-// -----------------------------------------------------------------------------------------------------------------------
-
-/*
-void mqttTaskExec(void *pvParameters)
-{
-  mqttPubHandle_t mqttMsg;
-
-  // Configuring LWT (status) topic
-  #if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
-    _mqttTopicStatus = mqttGetTopic1(CONFIG_MQTT_STATUS_TOPIC);
-    #if CONFIG_MQTT_STATUS_LWT
-    esp_mqtt_set_lwt_topic(_mqttTopicStatus);
-    #endif // CONFIG_MQTT_STATUS_LWT
-  #endif // CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
-
-  // Launching the MQTT client
-  ledSysOn(true);
-
-  if (!esp_mqtt_start()) {
-    rlog_e("Failed to create a MQTT client!");
-    #if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
-    free(_mqttTopicStatus);
-    #endif // CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_CONNECT
-    ledSysOff(true);
-    ledSysStateSet(SYSLED_ERROR, false);
-    mqttTaskDelete();
-    return;
-  };
-
-  // Creating an outbox
-  mqttOutboxHandle_t mqttOutbox = mqttOutboxInit();
-
-  // Periodic (1 time per minute) publication of date and time
-  #if CONFIG_MQTT_TIME_ENABLE
-    _mqttTopicTime = mqttGetTopic1(CONFIG_MQTT_TIME_TOPIC);
-  #endif // CONFIG_MQTT_TIME_ENABLE
-
-  // Topic for system information
-  #if CONFIG_MQTT_SYSINFO_ENABLE
-    _mqttTopicSysInfo = mqttGetTopic1(CONFIG_MQTT_SYSINFO_TOPIC);
-  #endif // CONFIG_MQTT_SYSINFO_ENABLE
-
-  // Timer for posting messages
-  #if defined(CONFIG_MQTT_PUBLISH_INTERVAL) && (CONFIG_MQTT_PUBLISH_INTERVAL > 0)
-    static esp_lwmqtt_timer_t mqttPubTimer;
-    esp_lwmqtt_timer_set(&mqttPubTimer, 0);
-  #endif // CONFIG_MQTT_PUBLISH_INTERVAL
-
-  // Timer for posting system information
-  #if CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_SYSINFO_ENABLE
-    static esp_lwmqtt_timer_t mqttSysInfoTimer;
-    esp_lwmqtt_timer_set(&mqttSysInfoTimer, 0);
-  #endif // CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_SYSINFO_ENABLE
-
-  ledSysOff(true);
-
-  while (true) {
-    // If messages are received in the send queue
-    if (xQueueReceive(_mqttQueue, &mqttMsg, 1000 / portTICK_PERIOD_MS) == pdPASS) {
-      // Let's try to find this topic in the queue
-      mqttPubHandle_t findMsg = mqttOutboxFind(mqttOutbox, mqttMsg);
-      if (findMsg) {
-        // If we find, then we replace its payload and parameters
-        if (findMsg->free_payload) free(findMsg->payload);
-        findMsg->payload = mqttMsg->payload;
-        findMsg->free_payload = mqttMsg->free_payload;
-        findMsg->qos = mqttMsg->qos;
-        findMsg->retained = mqttMsg->retained;
-        // Free memory
-        if (mqttMsg->free_topic) free(mqttMsg->topic);
-        mqttMsg->payload = NULL; // We passed the payload to another message
-        free(mqttMsg);
-      }
-      else {
-        // Otherwise, add an entry to the send queue
-        if (mqttMsg->forced) {
-          STAILQ_INSERT_HEAD(mqttOutbox, mqttMsg, next);
-        }
-        else {
-          STAILQ_INSERT_TAIL(mqttOutbox, mqttMsg, next);
+      if (msg_id > -1) {
+        if (strlen(payload) > MQTT_LOG_PAYLOAD_LIMIT) {
+          rlog_i(logTAG, "Publish to topic \"%s\": [ %d bytes ]", topic, strlen(payload));
+        } else {
+          rlog_i(logTAG, "Publish to topic \"%s\": %s", topic, payload);
         };
       };
-      rlog_v(tagMQTTQ, "Message \"%s\" [ %d ] successfully added the outbox", mqttMsg->topic, strlen(mqttMsg->payload));
-    };
-
-    // Fix and publish current time 
-    mqttFixTime();
-
-    // Publish system information
-    #if CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_SYSINFO_ENABLE
-      if (esp_lwmqtt_timer_get(&mqttSysInfoTimer) < 1) {
-        mqttPublishSysInfo();
-        esp_lwmqtt_timer_set(&mqttSysInfoTimer, CONFIG_MQTT_SYSINFO_INTERVAL);
+      if (free_topic) free(topic);
+      if (free_payload) free(payload);
+    } else {
+      if (forced) {
+        msg_id = esp_mqtt_client_publish(_mqttClient, topic, payload, 0, qos, retained);
+      } else {
+        msg_id = esp_mqtt_client_enqueue(_mqttClient, topic, payload, 0, qos, retained, true);
       };
-    #endif // CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_SYSINFO_ENABLE
-
-    // Sending first message from the queue
-    if (wifiIsConnected() && esp_mqtt_is_connected()) {
-      if (!STAILQ_EMPTY(mqttOutbox)) {
-        #if defined(CONFIG_MQTT_PUBLISH_INTERVAL) && (CONFIG_MQTT_PUBLISH_INTERVAL > 0)
-          if (esp_lwmqtt_timer_get(&mqttPubTimer) < 1) {
-            mqttOutboxPublish(mqttOutbox);
-            esp_lwmqtt_timer_set(&mqttPubTimer, CONFIG_MQTT_PUBLISH_INTERVAL);
-          };
-        #else
-          mqttOutboxPublish(mqttOutbox);
-        #endif // CONFIG_MQTT_PUBLISH_INTERVAL
+      if (msg_id > -1) {
+        rlog_i(logTAG, "Publish to topic \"%s\": NULL [ 0 bytes ]", topic);
       };
+      if (free_topic) free(topic);
     };
+    if (msg_id == -1) {
+      rlog_e(logTAG, "Failed to publish to topic \"%s\"!", topic);
+      mqttErrorEventSend(nullptr);
+      return false;
+    };
+    return true;
   };
-
-  // release outbox
-  mqttOutboxFree(mqttOutbox);
-
-  // release standard topics
-  #if CONFIG_MQTT_TIME_ENABLE
-    if (_mqttTopicTime) free(_mqttTopicTime);
-  #endif // CONFIG_MQTT_TIME_ENABLE
-  #if CONFIG_MQTT_SYSINFO_ENABLE
-    if (_mqttTopicSysInfo) free(_mqttTopicSysInfo);
-  #endif // CONFIG_MQTT_SYSINFO_ENABLE
-  #if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
-    if (_mqttTopicStatus) free(_mqttTopicStatus);
-  #endif // CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_CONNECT
-
-  // Delete queue and task
-  mqttTaskDelete();
+  return false;
 }
-*/
 
 // -----------------------------------------------------------------------------------------------------------------------
 // -------------------------------------------------- Event callback -----------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
 
-static esp_err_t mqttEventHandlerCb(esp_mqtt_event_handle_t event)
+static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
-  // esp_mqtt_client_handle_t client = event->client;
-  switch (event->event_id) {
+  // esp_mqtt_client_handle_t client = data->client;
+  esp_mqtt_event_handle_t data = (esp_mqtt_event_handle_t)event_data;
+  static char* str_value = nullptr;
+  static re_mqtt_incoming_data_t in_buffer;
+  memset(&in_buffer, 0, sizeof(re_mqtt_incoming_data_t));
+
+  switch (data->event_id) {
+    case MQTT_EVENT_BEFORE_CONNECT:
+      _mqttData.conn_attempt++;
+      rlog_i(logTAG, "Attempt # %d to connect to MQTT broker [ %s : %d ]...", _mqttData.conn_attempt, _mqttData.host, _mqttData.port);
+    break;
+
     case MQTT_EVENT_CONNECTED:
-      _mqttConnected = true;
-      _mqttConnCnt++;
-      ledSysStateClear(SYSLED_MQTT_ERROR, false);
-      rlog_i(tagMQTT, "Connection to MQTT server established");
-      // Recovering subscriptions for all params
-      paramsMqttSubscribesOpen();
-      // We send a notification to Telegram
-      #if CONFIG_TELEGRAM_ENABLE && CONFIG_MQTT_STATUS_TG_NOTIFY
-        if (_mqttConnCnt > 1) tgSend(false, CONFIG_TELEGRAM_DEVICE, CONFIG_MESSAGE_TG_MQTT_CONNECT);
-      #endif // CONFIG_TELEGRAM_ENABLE && CONFIG_MQTT_STATUS_TG_NOTIFY
+      _mqttData.connected = true;
+      _mqttData.conn_attempt = 0;
+      memset(&_mqttData.err_codes, 0, sizeof(_mqttData.err_codes));
+      rlog_i(logTAG, "Connection to MQTT broker [ %s : %d ] established", _mqttData.host, _mqttData.port);
+      // Repost event to main event loop
+      eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONNECTED, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
+      mqttErrorEventClear();
+      // Publish ONLINE static status
+      #if CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_STATUS_ONLINE_SYSINFO
+      mqttPublish(mqttTopicStatusGet(), (char*)CONFIG_MQTT_STATUS_ONLINE_PAYLOAD, CONFIG_MQTT_STATUS_QOS, CONFIG_MQTT_STATUS_RETAINED, true, false, false);
+      #endif // CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_STATUS_ONLINE_SYSINFO
       break;
+
     case MQTT_EVENT_DISCONNECTED:
-      _mqttConnected = false;
-      ledSysStateSet(SYSLED_MQTT_ERROR, false);
-      rlog_w(tagMQTT, "Lost connection to MQTT server");
-      // Resetting the subscriptions of all params
-      paramsMqttSubscribesClose();
-      // We send a notification to Telegram
-      #if CONFIG_TELEGRAM_ENABLE && CONFIG_MQTT_STATUS_TG_NOTIFY
-        tgSend(true, CONFIG_TELEGRAM_DEVICE, CONFIG_MESSAGE_TG_MQTT_DISCONNECT);
-      #endif // CONFIG_TELEGRAM_ENABLE && CONFIG_MQTT_STATUS_TG_NOTIFY
+      mqttErrorEventSend(nullptr);
+      if (_mqttData.connected) {
+        // The connection has already been established before, the connection is lost
+        _mqttData.connected = false;
+        rlog_w(logTAG, "Lost connection to MQTT broker [ %s : %d ]", _mqttData.host, _mqttData.port);
+        // Repost event to main event loop
+        eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_LOST, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
+      } else {
+        // Failed to establish connection
+        if (_mqttData.conn_attempt == CONFIG_MQTT_CONNECT_ATTEMPTS) {
+          // Repost event to main event loop
+          eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_FAILED, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
+          #ifdef CONFIG_MQTT2_TYPE
+          // Switching to the another server - disable current server
+          if (_mqttPrimary) {
+            mqttServer1SetAvailable(false);
+          } else {
+            mqttServer2SetAvailable(false);
+          };
+          #endif // CONFIG_MQTT2_TYPE
+        };
+      };
       break;
 
     case MQTT_EVENT_SUBSCRIBED:
-      ledSysStateClear(SYSLED_MQTT_ERROR, false);
-      rlog_i(tagMQTT, "Subscribed to: %s", event->topic);
-      break;
     case MQTT_EVENT_UNSUBSCRIBED:
-      ledSysStateClear(SYSLED_MQTT_ERROR, false);
-      rlog_i(tagMQTT, "Unsubscribed from: %s", event->topic);
-      break;
-    
     case MQTT_EVENT_PUBLISHED:
-      ledSysStateClear(SYSLED_MQTT_ERROR, false);
-      if (event->data_len > MQTT_LOG_PAYLOAD_LIMIT) {
-        rlog_i(tagMQTT, "Published: %s [ %d bytes ]", event->topic, event->data_len);
-      } else {
-        rlog_i(tagMQTT, "Published: %s [ %s ]", event->topic, event->data);
-      };
+      mqttErrorEventClear();
       break;
     
     case MQTT_EVENT_DATA:
-      paramsMqttIncomingMessage(event->topic, event->data, event->data_len);
+      if (data->current_data_offset == 0) {
+        if (in_buffer.topic) free(in_buffer.topic);
+        if (in_buffer.data) free(in_buffer.data);
+        in_buffer.data = (char*)calloc(1, data->total_data_len+1);
+      };
+      if (in_buffer.data) {
+        memcpy(in_buffer.data+data->current_data_offset, data->data, data->data_len);
+        if (data->current_data_offset + data->data_len == data->total_data_len) {
+          in_buffer.topic = malloc_stringl(data->topic, data->topic_len);
+          in_buffer.topic_len = data->topic_len;
+          in_buffer.data_len = data->total_data_len;
+          rlog_d(logTAG, "Incoming message \"%.*s\": [%s]", data->topic_len, data->topic, in_buffer.data);
+          // Repost string to main event loop
+          eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_INCOMING_DATA, &in_buffer, sizeof(in_buffer), portMAX_DELAY);
+        };
+      };
       break;
     
     case MQTT_EVENT_ERROR:
-      ledSysStateSet(SYSLED_MQTT_ERROR, false);
-      if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-        rlog_e(tagMQTT, "Last error code reported from esp-tls: 0x%x", event->error_handle->esp_tls_last_esp_err);
-        rlog_e(tagMQTT, "Last tls stack error number: 0x%x", event->error_handle->esp_tls_stack_err);
-        rlog_e(tagMQTT, "Last captured errno: %d (%s)",  event->error_handle->esp_transport_sock_errno, strerror(event->error_handle->esp_transport_sock_errno));
-        #if CONFIG_TELEGRAM_ENABLE && CONFIG_MQTT_STATUS_TG_NOTIFY
-          tgSend(true, CONFIG_TELEGRAM_DEVICE, CONFIG_MESSAGE_TG_MQTT_ERROR, strerror(event->error_handle->esp_transport_sock_errno), event->error_handle->esp_transport_sock_errno);
-        #endif // CONFIG_TELEGRAM_ENABLE && CONFIG_MQTT_STATUS_TG_NOTIFY
-      } else if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
-        rlog_e(tagMQTT, "Connection refused, error: 0x%x", event->error_handle->connect_return_code);
-        #if CONFIG_TELEGRAM_ENABLE && CONFIG_MQTT_STATUS_TG_NOTIFY
-          tgSend(true, CONFIG_TELEGRAM_DEVICE, CONFIG_MESSAGE_TG_MQTT_ERROR, "connection refused", event->error_handle->connect_return_code);
-        #endif // CONFIG_TELEGRAM_ENABLE && CONFIG_MQTT_STATUS_TG_NOTIFY
+      memcpy(&_mqttData.err_codes, data->error_handle, sizeof(_mqttData.err_codes));
+      // Generate error message
+      if (data->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+        str_value = malloc_stringf("transport error %d (%s) | ESP_TLS error code: 0x%x | TLS stack error: 0x%x", 
+          data->error_handle->esp_transport_sock_errno, strerror(data->error_handle->esp_transport_sock_errno),
+          data->error_handle->esp_tls_last_esp_err, data->error_handle->esp_tls_stack_err);
+      } else if (data->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
+        str_value = malloc_stringf("connection refused, error: 0x%x", 
+          data->error_handle->connect_return_code);
       } else {
-        rlog_e(tagMQTT, "Unknown error type: 0x%x", event->error_handle->error_type);
-        #if CONFIG_TELEGRAM_ENABLE && CONFIG_MQTT_STATUS_TG_NOTIFY
-          tgSend(true, CONFIG_TELEGRAM_DEVICE, CONFIG_MESSAGE_TG_MQTT_ERROR, "unknown error type", event->error_handle->error_type);
-        #endif // CONFIG_TELEGRAM_ENABLE && CONFIG_MQTT_STATUS_TG_NOTIFY
+        str_value = malloc_stringf("unknown error type: 0x%x", 
+          data->error_handle->error_type);
       };
+      // Repost event to main event loop
+      mqttErrorEventSend(str_value);
+      if (str_value) rlog_e(logTAG, "MQTT client error: %s", str_value);
       break;
 
     default:
-      rlog_w(tagMQTT, "Other event id: %d", event->event_id); 
+      rlog_w(logTAG, "Other event id: %d", data->event_id); 
       break;
   };
-  return ESP_OK;
-};
-
-static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
-{
-  mqttEventHandlerCb((esp_mqtt_event_handle_t)event_data);
+  // Free resources
+  if (str_value) {
+    free(str_value);
+    str_value = nullptr;
+  };
 }
+
+// -----------------------------------------------------------------------------------------------------------------------
+// --------------------------------------------------- Configuration -----------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------
+
+void mqttSetConfigPrimary(esp_mqtt_client_config_t * mqttCfg)
+{
+  memset(mqttCfg, 0, sizeof(esp_mqtt_client_config_t));
+
+  // Host
+  _mqttData.primary = true;
+  #if CONFIG_MQTT1_TYPE == 0
+    _mqttData.local = false;
+  #else
+    _mqttData.local = true;
+  #endif // CONFIG_MQTT1_TYPE == 0
+  #if CONFIG_MQTT1_TYPE == 2
+    _mqttData.host = wifiGetGatewayIP();
+  #else
+    _mqttData.host = malloc_string(CONFIG_MQTT1_HOST);
+  #endif // CONFIG_MQTT1_TYPE == 2
+  mqttCfg->host = _mqttData.host;
+
+  // Port and transport
+  #if CONFIG_MQTT1_TLS_ENABLED
+    _mqttData.port = CONFIG_MQTT1_PORT_TLS;
+    mqttCfg->transport = MQTT_TRANSPORT_OVER_SSL;
+    mqttCfg->port = CONFIG_MQTT1_PORT_TLS;
+    mqttCfg->cert_pem = (const char *)mqtt1_broker_pem_start;
+    mqttCfg->skip_cert_common_name_check = CONFIG_MQTT1_TLS_NAME_CHECK;
+  #else
+    _mqttData.port = CONFIG_MQTT1_PORT_TCP;
+    mqttCfg->transport = MQTT_TRANSPORT_OVER_TCP;
+    mqttCfg->port = CONFIG_MQTT1_PORT_TCP;
+  #endif // CONFIG_MQTT1_TLS_ENABLED
+
+  // Credentials
+  #ifdef CONFIG_MQTT1_USERNAME
+    mqttCfg->username = CONFIG_MQTT1_USERNAME;
+  #ifdef CONFIG_MQTT1_PASSWORD
+    mqttCfg->password = CONFIG_MQTT1_PASSWORD;
+  #endif // CONFIG_MQTT1_PASSWORD
+  #endif // CONFIG_MQTT1_USERNAME
+
+  // ClientId, if needed. Otherwise ClientId will be generated automatically
+  #ifdef CONFIG_MQTT1_CLIENTID
+    mqttCfg->client_id = CONFIG_MQTT1_CLIENTID;
+  #endif // CONFIG_MQTT_CLIENTID
+
+  // Connection parameters
+  mqttCfg->network_timeout_ms = CONFIG_MQTT1_TIMEOUT;
+  mqttCfg->reconnect_timeout_ms = CONFIG_MQTT1_RECONNECT;
+  mqttCfg->keepalive = CONFIG_MQTT1_KEEP_ALIVE;
+  mqttCfg->disable_keepalive = false;
+  mqttCfg->buffer_size = CONFIG_MQTT_READ_BUFFER_SIZE;
+  mqttCfg->out_buffer_size = CONFIG_MQTT_WRITE_BUFFER_SIZE;
+  mqttCfg->task_prio = CONFIG_MQTT_CLIENT_PRIORITY;
+  mqttCfg->task_stack = CONFIG_MQTT_CLIENT_STACK_SIZE;
+  mqttCfg->disable_auto_reconnect = !CONFIG_MQTT1_AUTO_RECONNECT;
+  mqttCfg->disable_clean_session = !CONFIG_MQTT1_CLEAN_SESSION;
+  mqttCfg->use_global_ca_store = false;
+
+  // LWT
+  #if CONFIG_MQTT_STATUS_LWT
+  mqttCfg->lwt_topic = mqttTopicStatusCreate(true);
+  mqttCfg->lwt_msg = CONFIG_MQTT_STATUS_LWT_PAYLOAD;
+  mqttCfg->lwt_msg_len = strlen(CONFIG_MQTT_STATUS_LWT_PAYLOAD);
+  mqttCfg->lwt_qos = CONFIG_MQTT_STATUS_QOS;
+  mqttCfg->lwt_retain = CONFIG_MQTT_STATUS_RETAINED;
+  #endif // CONFIG_MQTT_STATUS_LWT
+}
+
+#ifdef CONFIG_MQTT2_TYPE
+
+void mqttSetConfigReserved(esp_mqtt_client_config_t * mqttCfg)
+{
+  memset(mqttCfg, 0, sizeof(esp_mqtt_client_config_t));
+
+  // Host
+  _mqttData.primary = false;
+  #if CONFIG_MQTT2_TYPE == 0
+    _mqttData.local = false;
+  #else
+    _mqttData.local = true;
+  #endif // CONFIG_MQTT2_TYPE == 0
+  #if CONFIG_MQTT2_TYPE == 2
+    _mqttData.host = wifiGetGatewayIP();
+  #else
+    _mqttData.host = malloc_string(CONFIG_MQTT2_HOST);
+  #endif // CONFIG_MQTT2_TYPE == 2
+  mqttCfg->host = _mqttData.host;
+
+  // Port and transport
+  #if CONFIG_MQTT2_TLS_ENABLED
+    _mqttData.port = CONFIG_MQTT2_PORT_TLS;
+    mqttCfg->transport = MQTT_TRANSPORT_OVER_SSL;
+    mqttCfg->port = CONFIG_MQTT2_PORT_TLS;
+    mqttCfg->cert_pem = (const char *)mqtt2_broker_pem_start;
+    mqttCfg->skip_cert_common_name_check = CONFIG_MQTT2_TLS_NAME_CHECK;
+  #else
+    _mqttData.port = CONFIG_MQTT2_PORT_TCP;
+    mqttCfg->transport = MQTT_TRANSPORT_OVER_TCP;
+    mqttCfg->port = CONFIG_MQTT2_PORT_TCP;
+  #endif // CONFIG_MQTT2_TLS_ENABLED
+
+  // Credentials
+  #ifdef CONFIG_MQTT2_USERNAME
+    mqttCfg->username = CONFIG_MQTT2_USERNAME;
+  #ifdef CONFIG_MQTT2_PASSWORD
+    mqttCfg->password = CONFIG_MQTT2_PASSWORD;
+  #endif // CONFIG_MQTT2_PASSWORD
+  #endif // CONFIG_MQTT2_USERNAME
+
+  // ClientId, if needed. Otherwise ClientId will be generated automatically
+  #ifdef CONFIG_MQTT2_CLIENTID
+    mqttCfg->client_id = CONFIG_MQTT2_CLIENTID;
+  #endif // CONFIG_MQTT_CLIENTID
+
+  // Connection parameters
+  mqttCfg->network_timeout_ms = CONFIG_MQTT2_TIMEOUT;
+  mqttCfg->reconnect_timeout_ms = CONFIG_MQTT2_RECONNECT;
+  mqttCfg->keepalive = CONFIG_MQTT2_KEEP_ALIVE;
+  mqttCfg->disable_keepalive = false;
+  mqttCfg->buffer_size = CONFIG_MQTT_READ_BUFFER_SIZE;
+  mqttCfg->out_buffer_size = CONFIG_MQTT_WRITE_BUFFER_SIZE;
+  mqttCfg->task_prio = CONFIG_MQTT_CLIENT_PRIORITY;
+  mqttCfg->task_stack = CONFIG_MQTT_CLIENT_STACK_SIZE;
+  mqttCfg->disable_auto_reconnect = !CONFIG_MQTT2_AUTO_RECONNECT;
+  mqttCfg->disable_clean_session = !CONFIG_MQTT2_CLEAN_SESSION;
+  mqttCfg->use_global_ca_store = false;
+
+  // LWT
+  #if CONFIG_MQTT_STATUS_LWT
+  mqttCfg->lwt_topic = mqttTopicStatusCreate(false);
+  mqttCfg->lwt_msg = CONFIG_MQTT_STATUS_LWT_PAYLOAD;
+  mqttCfg->lwt_msg_len = strlen(CONFIG_MQTT_STATUS_LWT_PAYLOAD);
+  mqttCfg->lwt_qos = CONFIG_MQTT_STATUS_QOS;
+  mqttCfg->lwt_retain = CONFIG_MQTT_STATUS_RETAINED;
+  #endif // CONFIG_MQTT_STATUS_LWT
+}
+
+#endif // CONFIG_MQTT2_TYPE
 
 // -----------------------------------------------------------------------------------------------------------------------
 // --------------------------------------------------- Task routines -----------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
 
-bool mqttTaskCreate() 
+#define START_CHECK(a, msg)                                 \
+  do {                                                      \
+    if (!(a)) {                                             \
+      rlog_e(logTAG, msg);                                  \
+      eventLoopPostSystem(RE_SYS_ERROR, RE_SYS_SET, false); \
+      return false;                                         \
+    }                                                       \
+  } while (0)
+
+bool mqttStart() 
 {
-  if (!_mqttClient) {
-    esp_err_t err = ESP_OK;
+  if (_mqttClient) {
+    return mqttTaskStop();
+  };
 
-    _mqttConnected = false;
-    _mqttConnCnt = 0;
+  _mqttState = MQTT_CLIENT_STOPPED;
+  memset(&_mqttData, 0, sizeof(_mqttData));
 
-    // Configuring broker parameters
-    static esp_mqtt_client_config_t _mqttCfg;
-    memset(&_mqttCfg, 0, sizeof(_mqttCfg));
-
-    _mqttCfg.host = CONFIG_MQTT_HOST;
-    #ifdef CONFIG_MQTT_USERNAME
-    _mqttCfg.username = CONFIG_MQTT_USERNAME;
-    #ifdef CONFIG_MQTT_PASSWORD
-    _mqttCfg.password = CONFIG_MQTT_PASSWORD;
-    #endif // CONFIG_MQTT_PASSWORD
-    #endif // CONFIG_MQTT_USERNAME
-    #ifdef CONFIG_MQTT_CLIENTID
-    _mqttCfg.client_id = CONFIG_MQTT_CLIENTID;
-    #endif // CONFIG_MQTT_CLIENTID
-    _mqttCfg.network_timeout_ms = CONFIG_MQTT_TIMEOUT;
-    _mqttCfg.reconnect_timeout_ms = CONFIG_MQTT_RECONNECT;
-    _mqttCfg.keepalive = CONFIG_MQTT_KEEP_ALIVE;
-    _mqttCfg.disable_keepalive = false;
-    _mqttCfg.buffer_size = CONFIG_MQTT_READ_BUFFER_SIZE;
-    _mqttCfg.out_buffer_size = CONFIG_MQTT_WRITE_BUFFER_SIZE;
-    _mqttCfg.task_prio = CONFIG_MQTT_CLIENT_PRIORITY;
-    _mqttCfg.task_stack = CONFIG_MQTT_CLIENT_STACK_SIZE;
-    _mqttCfg.disable_auto_reconnect = !CONFIG_MQTT_AUTO_RECONNECT;
-    _mqttCfg.disable_clean_session = !CONFIG_MQTT_CLEAN_SESSION;
-    _mqttCfg.use_global_ca_store = false;
-    #ifdef CONFIG_MQTT_STATUS_LWT
-    _mqttStatusTopic = mqttGetTopic1(CONFIG_MQTT_STATUS_TOPIC);
-    _mqttCfg.lwt_topic = _mqttStatusTopic;
-    _mqttCfg.lwt_msg = CONFIG_MQTT_STATUS_LWT_PAYLOAD;
-    _mqttCfg.lwt_msg_len = strlen(CONFIG_MQTT_STATUS_LWT_PAYLOAD);
-    _mqttCfg.lwt_qos = CONFIG_MQTT_STATUS_QOS;
-    _mqttCfg.lwt_retain = CONFIG_MQTT_STATUS_RETAINED;
-    #endif // CONFIG_MQTT_STATUS_LWT
-    
-    #if CONFIG_MQTT_TLS_ENABLE
-    _mqttCfg.transport = MQTT_TRANSPORT_OVER_SSL;
-    _mqttCfg.port = CONFIG_MQTT_PORT_TLS;
-    _mqttCfg.cert_pem = (const char *)mqtt_broker_pem_start;
-    _mqttCfg.skip_cert_common_name_check = CONFIG_MQTT_TLS_NAME_CHECK;
-    #else
-    _mqttCfg.transport = MQTT_TRANSPORT_OVER_TCP;
-    _mqttCfg.port = CONFIG_MQTT_PORT_TCP;
-    #endif // CONFIG_MQTT_TLS_ENABLE
-      
-    // Launching the client
-    _mqttClient = esp_mqtt_client_init(&_mqttCfg);
-    if (_mqttClient) {
-      err = esp_mqtt_client_register_event(_mqttClient, MQTT_EVENT_ANY, mqttEventHandler, _mqttClient);
-      if (err != ESP_OK) {
-        rlog_e(tagMQTT, "Failed to register event handler!");
-        ledSysStateSet(SYSLED_ERROR, false);
-        return false;
-      };
-      err = esp_mqtt_client_start(_mqttClient); 
-      if (err != ESP_OK) {
-        rlog_e(tagMQTT, "Failed to start MQTT client!");
-        ledSysStateSet(SYSLED_ERROR, false);
-        return false;
-      };
-      rlog_d(tagMQTT, "Task [ MQTT_CLIENT ] was created");
-      return true;
+  // Configuring broker parameters
+  static esp_mqtt_client_config_t _mqttCfg;
+  #ifdef CONFIG_MQTT2_TYPE
+    if (_mqttPrimary) {
+      mqttSetConfigPrimary(&_mqttCfg);
     } else {
-      rlog_e(tagMQTT, "Failed to create MQTT client!");
-      ledSysStateSet(SYSLED_ERROR, false);
-      return false;
+      mqttSetConfigReserved(&_mqttCfg);
     };
+  #else
+    mqttSetConfigPrimary(&_mqttCfg);
+  #endif // CONFIG_MQTT2_TYPE
+    
+  // Launching the client
+  _mqttClient = esp_mqtt_client_init(&_mqttCfg);
+  START_CHECK(_mqttClient, 
+    "Failed to create MQTT client!");
+  START_CHECK(esp_mqtt_client_register_event(_mqttClient, MQTT_EVENT_ANY, mqttEventHandler, _mqttClient) == ESP_OK, 
+    "Failed to register event handler!");
+  START_CHECK(esp_mqtt_client_start(_mqttClient) == ESP_OK, 
+    "Failed to start MQTT client!");
+  
+  _mqttState = MQTT_CLIENT_STARTED;
+  rlog_i(logTAG, "Task [ MQTT_CLIENT ] was created");
+  return true;
+}
+
+bool mqttTaskStart(bool createSuspended)
+{
+  if (createSuspended) {
+    return mqttEventHandlerRegister();
   } else {
-    return mqttTaskResume(); 
+    return mqttServerSelectAuto();
   };
 }
 
-bool mqttTaskDelete()
+bool mqttTaskStop()
 {
   if (_mqttClient) {
     esp_err_t err = esp_mqtt_client_destroy(_mqttClient);
     if (err != ESP_OK) {
-      rlog_e(tagMQTT, "Failed to destroy MQTT client!");
-      ledSysStateSet(SYSLED_ERROR, false);
+      rlog_e(logTAG, "Failed to destroy MQTT client!");
+      eventLoopPostSystem(RE_SYS_ERROR, RE_SYS_SET, false);
       return false;
     };
     _mqttClient = nullptr;
+    _mqttState = MQTT_CLIENT_STOPPED;
+    _mqttData.connected = false;
+    _mqttData.conn_attempt = 0;
 
-    #ifdef CONFIG_MQTT_STATUS_LWT
-    if (_mqttStatusTopic) {
-      free(_mqttStatusTopic);
-      _mqttStatusTopic = nullptr;
+    if (_mqttData.host) {
+      free(_mqttData.host);
+      _mqttData.host = nullptr;
     };
-    #endif // CONFIG_MQTT_STATUS_LWT
 
-    rlog_d(tagMQTT, "Task [ MQTT_CLIENT ] was deleted");
+    #if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
+    mqttTopicStatusFree();
+    #endif // CONFIG_MQTT_STATUS_LWT
+    
+    rlog_d(logTAG, "Task [ MQTT_CLIENT ] was deleted");
     return true;
   };
   return false;
@@ -622,16 +732,16 @@ bool mqttTaskSuspend()
   if (_mqttClient) {
     esp_err_t err = esp_mqtt_client_stop(_mqttClient);
     if (err != ESP_OK) {
-      rlog_e(tagMQTT, "Failed to stop MQTT client!");
-      ledSysStateSet(SYSLED_ERROR, false);
+      rlog_e(logTAG, "Failed to stop MQTT client!");
+      eventLoopPostSystem(RE_SYS_ERROR, RE_SYS_SET, false);
       return false;
     };
-    rlog_d(tagMQTT, "Task [ MQTT_CLIENT ] was stopped");
+    
+    _mqttState = MQTT_CLIENT_SUSPENDED;
+    rlog_d(logTAG, "Task [ MQTT_CLIENT ] was stopped");
     return true;
-  } else {
-    rlog_w(tagMQTT, "Task [ MQTT_CLIENT ] not found");
-    return false;
   };
+  return false;
 }
 
 bool mqttTaskResume()
@@ -639,15 +749,113 @@ bool mqttTaskResume()
   if (_mqttClient) {
     esp_err_t err = esp_mqtt_client_start(_mqttClient);
     if (err != ESP_OK) {
-      rlog_e(tagMQTT, "Failed to start MQTT client!");
-      ledSysStateSet(SYSLED_ERROR, false);
+      rlog_e(logTAG, "Failed to start MQTT client!");
+      eventLoopPostSystem(RE_SYS_ERROR, RE_SYS_SET, false);
       return false;
     };
-    rlog_d(tagMQTT, "Task [ MQTT_CLIENT ] was started");
+    
+    _mqttState = MQTT_CLIENT_STARTED;
+    rlog_d(logTAG, "Task [ MQTT_CLIENT ] was started");
     return true;
-  } else {
-    rlog_w(tagMQTT, "Task [ MQTT_CLIENT ] not found");
-    return false;
   };
+  return false;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------
+// -------------------------------------------------- WiFi event handler -------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------
+
+static void mqttWiFiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
+{
+  // STA connected, Internet access not checked
+  if (event_id == RE_WIFI_STA_GOT_IP) {
+    mqttServerSelectInet(false);
+  }
+  // STA connected and Internet access is available
+  else if (event_id == RE_WIFI_STA_PING_OK) {
+    mqttServerSelectInet(true);
+  }
+  // Internet access lost
+  else if (event_id == RE_WIFI_STA_PING_FAILED) {
+    mqttServerSelectInet(false);
+  }
+  // STA disconnected
+  else if ((event_id == RE_WIFI_STA_DISCONNECTED) || (event_id == RE_WIFI_STA_STOPPED)) {
+    if (_mqttState == MQTT_CLIENT_STARTED) {
+      mqttTaskSuspend();
+    };
+  };
+}
+
+static void mqttSelfEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
+{
+  if ((event_id == RE_MQTT_SERVER_PRIMARY) || (event_id == RE_MQTT_SERVER_RESERVED)) {
+    mqttTaskStop();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    mqttStart();
+  };
+}
+
+#if defined(CONFIG_MQTT2_TYPE) && CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES && CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0
+static void mqttTimeEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
+{
+  if (event_id == RE_TIME_EVERY_MINUTE) {
+    _mqttBackToPrimarty++;
+    if (_mqttBackToPrimarty >= CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES) {
+      _mqttBackToPrimarty = 0;
+      rlog_i(logTAG, "Attempting to switch to the primary server...");
+      mqttServer1SetAvailable(true);
+    };
+  };
+}
+#endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
+
+#if defined(CONFIG_MQTT1_PING_CHECK) && CONFIG_MQTT1_PING_CHECK
+static void mqttPing1EventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
+{
+  // rlog_d("tgEVT", "Recieved PING event: %s %d", event_base, event_id);
+  ping_inet_data_t* data = (ping_inet_data_t*)event_data;
+
+  // Broker 1 is available
+  if (event_id == RE_PING_MQTT1_AVAILABLE) {
+    mqttServer1SetAvailable(true);
+  }
+  // Broker 1 is unavailable
+  else if (event_id == RE_PING_MQTT1_UNAVAILABLE) {
+    mqttServer1SetAvailable(false);
+  }
+}
+#endif // CONFIG_MQTT1_PING_CHECK
+
+#if defined(CONFIG_MQTT2_TYPE) && defined(CONFIG_MQTT2_PING_CHECK) && CONFIG_MQTT2_PING_CHECK
+static void mqttPing2EventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
+{
+  // rlog_d("tgEVT", "Recieved PING event: %s %d", event_base, event_id);
+  ping_inet_data_t* data = (ping_inet_data_t*)event_data;
+
+  // Broker 2 is available
+  if (event_id == RE_PING_MQTT2_AVAILABLE) {
+    mqttServer2SetAvailable(true);
+  }
+  // Broker 2 is unavailable
+  else if (event_id == RE_PING_MQTT2_UNAVAILABLE) {
+    mqttServer2SetAvailable(false);
+  }
+}
+#endif // CONFIG_MQTT1_PING_CHECK
+
+bool mqttEventHandlerRegister()
+{
+  return eventHandlerRegister(RE_WIFI_EVENTS, ESP_EVENT_ANY_ID, &mqttWiFiEventHandler, nullptr) 
+      #if defined(CONFIG_MQTT1_PING_CHECK) && CONFIG_MQTT1_PING_CHECK
+      && eventHandlerRegister(RE_PING_EVENTS, RE_PING_MQTT1_AVAILABLE, &mqttPing1EventHandler, nullptr)
+      && eventHandlerRegister(RE_PING_EVENTS, RE_PING_MQTT1_UNAVAILABLE, &mqttPing1EventHandler, nullptr)
+      #endif // CONFIG_MQTT1_PING_CHECK
+      #if defined(CONFIG_MQTT2_TYPE) && defined(CONFIG_MQTT2_PING_CHECK) && CONFIG_MQTT2_PING_CHECK
+      && eventHandlerRegister(RE_PING_EVENTS, RE_PING_MQTT2_AVAILABLE, &mqttPing2EventHandler, nullptr)
+      && eventHandlerRegister(RE_PING_EVENTS, RE_PING_MQTT2_UNAVAILABLE, &mqttPing2EventHandler, nullptr)
+      #endif // CONFIG_MQTT2_PING_CHECK
+      && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_SERVER_PRIMARY, &mqttSelfEventHandler, nullptr)
+      && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, &mqttSelfEventHandler, nullptr);
 }
 
