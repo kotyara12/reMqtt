@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "rLog.h"
+#include "reStates.h"
 #include "rStrings.h"
 #include "reEvents.h"
 #include "reEsp32.h"
@@ -313,7 +314,6 @@ bool mqttServerSelectInet(const bool internetAvailable)
 bool mqttSubscribe(const char *topic, int qos)
 {
   if (_mqttData.connected) {
-    eventLoopPostSystem(RE_SYS_SYSLED, RE_SYS_FLASH);
     int msg_id = esp_mqtt_client_subscribe(_mqttClient, topic, qos);
     if (msg_id == -1) {
       rlog_e(logTAG, "Failed to subscribe to topic \"%s\"!", topic);
@@ -329,7 +329,6 @@ bool mqttSubscribe(const char *topic, int qos)
 bool mqttUnsubscribe(const char *topic)
 {
   if (_mqttData.connected) {
-    eventLoopPostSystem(RE_SYS_SYSLED, RE_SYS_FLASH);
     int msg_id = esp_mqtt_client_unsubscribe(_mqttClient, topic);
     if (msg_id == -1) {
       rlog_e(logTAG, "Failed to unsubscribe from topic \"%s\"!", topic);
@@ -350,7 +349,6 @@ bool mqttPublish(char *topic, char *payload, int qos, bool retained, bool forced
 {
   if ((topic) && (_mqttData.connected)) {
     int msg_id;
-    eventLoopPostSystem(RE_SYS_SYSLED, RE_SYS_FLASH);
     if (payload) {
       if (forced) {
         msg_id = esp_mqtt_client_publish(_mqttClient, topic, payload, strlen(payload), qos, retained);
@@ -403,6 +401,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
     case MQTT_EVENT_BEFORE_CONNECT:
       _mqttData.conn_attempt++;
       rlog_i(logTAG, "Attempt # %d to connect to MQTT broker [ %s : %d ]...", _mqttData.conn_attempt, _mqttData.host, _mqttData.port);
+      ledSysActivity();
     break;
 
     case MQTT_EVENT_CONNECTED:
@@ -448,6 +447,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
     case MQTT_EVENT_UNSUBSCRIBED:
     case MQTT_EVENT_PUBLISHED:
       mqttErrorEventClear();
+      ledSysActivity();
       break;
     
     case MQTT_EVENT_DATA:
@@ -465,6 +465,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
           rlog_d(logTAG, "Incoming message \"%.*s\": [%s]", data->topic_len, data->topic, in_buffer.data);
           // Repost string to main event loop
           eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_INCOMING_DATA, &in_buffer, sizeof(in_buffer), portMAX_DELAY);
+          ledSysActivity();
         };
       };
       break;
@@ -486,6 +487,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
       // Repost event to main event loop
       mqttErrorEventSend(str_value);
       if (str_value) rlog_e(logTAG, "MQTT client error: %s", str_value);
+      ledSysActivity();
       break;
 
     default:
