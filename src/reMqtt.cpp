@@ -82,7 +82,7 @@ static char* _mqttTopicStatus = NULL;
 char* mqttTopicStatusCreate(const bool primary)
 {
   if (_mqttTopicStatus) free(_mqttTopicStatus);
-  _mqttTopicStatus = mqttGetTopic1(primary, CONFIG_MQTT_STATUS_LOCAL, CONFIG_MQTT_STATUS_TOPIC);
+  _mqttTopicStatus = mqttGetTopicDevice1(primary, CONFIG_MQTT_STATUS_LOCAL, CONFIG_MQTT_STATUS_TOPIC);
   rlog_i(logTAG, "Generated topic for publishing system status: [ %s ]", _mqttTopicStatus);
   return _mqttTopicStatus;
 }
