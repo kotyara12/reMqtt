@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "project_config.h"
+#include "def_consts.h"
 #include "esp_event_base.h"
 #include "mqtt_client.h"
 #include "rTypes.h"

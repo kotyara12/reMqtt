@@ -12,6 +12,7 @@
 #include "reMqtt.h"
 #include "reNvs.h"
 #include "project_config.h"
+#include "def_consts.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <time.h>
@@ -75,7 +76,7 @@ void mqttErrorEventClear()
 // ------------------------------------------------ Publish system status ------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
 
-#if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
+#if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_STATUS_ONLINE_SYSINFO
 
 static char* _mqttTopicStatus = NULL;
 
@@ -104,7 +105,7 @@ void mqttTopicStatusFree()
   rlog_d(logTAG, "Topic for publishing system status has been scrapped");
 }
 
-#endif // CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
+#endif // CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_STATUS_ONLINE_SYSINFO
 
 // -----------------------------------------------------------------------------------------------------------------------
 // -------------------------------------------------- Server selection ---------------------------------------------------
