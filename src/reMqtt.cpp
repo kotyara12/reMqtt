@@ -530,7 +530,7 @@ void mqttSetConfigPrimary(esp_mqtt_client_config_t * mqttCfg)
     mqttCfg->transport = MQTT_TRANSPORT_OVER_SSL;
     mqttCfg->port = CONFIG_MQTT1_PORT_TLS;
     mqttCfg->cert_pem = (const char *)mqtt1_broker_pem_start;
-    mqttCfg->skip_cert_common_name_check = CONFIG_MQTT1_TLS_NAME_CHECK;
+    mqttCfg->skip_cert_common_name_check = (CONFIG_MQTT1_TLS_NAME_CHECK == 0);
   #else
     _mqttData.port = CONFIG_MQTT1_PORT_TCP;
     mqttCfg->transport = MQTT_TRANSPORT_OVER_TCP;
