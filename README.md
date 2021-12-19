@@ -1,4 +1,4 @@
-# MQTT клиент for ESP32 / ESP-IDF
+# MQTT клиент для ESP32 / ESP-IDF
 
 > If you do not understand this text, please use the English version: <br/>https://github.com/kotyara12/reMqtt/blob/master/README_EN.md <br/>Sorry for the machine translation into English.
 
