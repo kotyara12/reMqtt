@@ -84,7 +84,11 @@ char* mqttTopicStatusCreate(const bool primary)
 {
   if (_mqttTopicStatus) free(_mqttTopicStatus);
   _mqttTopicStatus = mqttGetTopicDevice1(primary, CONFIG_MQTT_STATUS_LOCAL, CONFIG_MQTT_STATUS_TOPIC);
-  rlog_i(logTAG, "Generated topic for publishing system status: [ %s ]", _mqttTopicStatus);
+  if (_mqttTopicStatus) {
+    rlog_i(logTAG, "Generated topic for publishing system status: [ %s ]", _mqttTopicStatus);
+  } else {
+    rlog_i(logTAG, "Failed to denerate topic for publishing system status");
+  };
   return _mqttTopicStatus;
 }
 
@@ -314,7 +318,7 @@ bool mqttServerSelectInet(const bool internetAvailable)
 
 bool mqttSubscribe(const char *topic, int qos)
 {
-  if (_mqttData.connected) {
+  if (topic && _mqttData.connected) {
     int msg_id = esp_mqtt_client_subscribe(_mqttClient, topic, qos);
     if (msg_id == -1) {
       rlog_e(logTAG, "Failed to subscribe to topic \"%s\"!", topic);
@@ -329,7 +333,7 @@ bool mqttSubscribe(const char *topic, int qos)
 
 bool mqttUnsubscribe(const char *topic)
 {
-  if (_mqttData.connected) {
+  if (topic && _mqttData.connected) {
     int msg_id = esp_mqtt_client_unsubscribe(_mqttClient, topic);
     if (msg_id == -1) {
       rlog_e(logTAG, "Failed to unsubscribe from topic \"%s\"!", topic);
@@ -452,21 +456,25 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
       break;
     
     case MQTT_EVENT_DATA:
-      if (data->current_data_offset == 0) {
-        if (in_buffer.topic) free(in_buffer.topic);
-        if (in_buffer.data) free(in_buffer.data);
-        in_buffer.data = (char*)calloc(1, data->total_data_len+1);
-      };
-      if (in_buffer.data) {
-        memcpy(in_buffer.data+data->current_data_offset, data->data, data->data_len);
-        if (data->current_data_offset + data->data_len == data->total_data_len) {
-          in_buffer.topic = malloc_stringl(data->topic, data->topic_len);
-          in_buffer.topic_len = data->topic_len;
-          in_buffer.data_len = data->total_data_len;
-          rlog_d(logTAG, "Incoming message \"%.*s\": [%s]", data->topic_len, data->topic, in_buffer.data);
-          // Repost string to main event loop
-          eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_INCOMING_DATA, &in_buffer, sizeof(in_buffer), portMAX_DELAY);
-          ledSysActivity();
+      if (data) {
+        if (data->current_data_offset == 0) {
+          if (in_buffer.topic) free(in_buffer.topic);
+          if (in_buffer.data) free(in_buffer.data);
+          in_buffer.data = (char*)esp_malloc(data->total_data_len+1);
+        };
+        if (in_buffer.data) {
+          memcpy(in_buffer.data+data->current_data_offset, data->data, data->data_len);
+          if (data->current_data_offset + data->data_len == data->total_data_len) {
+            in_buffer.topic = malloc_stringl(data->topic, data->topic_len);
+            if (in_buffer.topic) {
+              in_buffer.topic_len = data->topic_len;
+              in_buffer.data_len = data->total_data_len;
+              rlog_d(logTAG, "Incoming message \"%.*s\": [%s]", data->topic_len, data->topic, in_buffer.data);
+              // Repost string to main event loop
+              eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_INCOMING_DATA, &in_buffer, sizeof(in_buffer), portMAX_DELAY);
+              ledSysActivity();
+            };
+          };
         };
       };
       break;
@@ -474,20 +482,22 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
     case MQTT_EVENT_ERROR:
       memcpy(&_mqttData.err_codes, data->error_handle, sizeof(_mqttData.err_codes));
       // Generate error message
-      if (data->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-        str_value = malloc_stringf("transport error %d (%s) | ESP_TLS error code: 0x%x | TLS stack error: 0x%x", 
-          data->error_handle->esp_transport_sock_errno, strerror(data->error_handle->esp_transport_sock_errno),
-          data->error_handle->esp_tls_last_esp_err, data->error_handle->esp_tls_stack_err);
-      } else if (data->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
-        str_value = malloc_stringf("connection refused, error: 0x%x", 
-          data->error_handle->connect_return_code);
-      } else {
-        str_value = malloc_stringf("unknown error type: 0x%x", 
-          data->error_handle->error_type);
+      if (data) {
+        if (data->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+          str_value = malloc_stringf("transport error %d (%s) | ESP_TLS error code: 0x%x | TLS stack error: 0x%x", 
+            data->error_handle->esp_transport_sock_errno, strerror(data->error_handle->esp_transport_sock_errno),
+            data->error_handle->esp_tls_last_esp_err, data->error_handle->esp_tls_stack_err);
+        } else if (data->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
+          str_value = malloc_stringf("connection refused, error: 0x%x", 
+            data->error_handle->connect_return_code);
+        } else {
+          str_value = malloc_stringf("unknown error type: 0x%x", 
+            data->error_handle->error_type);
+        };
+        // Repost event to main event loop
+        mqttErrorEventSend(str_value);
+        if (str_value) rlog_e(logTAG, "MQTT client error: %s", str_value);
       };
-      // Repost event to main event loop
-      mqttErrorEventSend(str_value);
-      if (str_value) rlog_e(logTAG, "MQTT client error: %s", str_value);
       ledSysActivity();
       break;
 
