@@ -456,33 +456,31 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
       break;
     
     case MQTT_EVENT_DATA:
-      if (data) {
+      if (event_data) {
         if (data->current_data_offset == 0) {
           if (in_buffer.topic) free(in_buffer.topic);
           if (in_buffer.data) free(in_buffer.data);
-          in_buffer.data = (char*)esp_malloc(data->total_data_len+1);
+          in_buffer.data = (char*)esp_calloc(1, data->total_data_len+1);
         };
         if (in_buffer.data) {
           memcpy(in_buffer.data+data->current_data_offset, data->data, data->data_len);
           if (data->current_data_offset + data->data_len == data->total_data_len) {
             in_buffer.topic = malloc_stringl(data->topic, data->topic_len);
-            if (in_buffer.topic) {
-              in_buffer.topic_len = data->topic_len;
-              in_buffer.data_len = data->total_data_len;
-              rlog_d(logTAG, "Incoming message \"%.*s\": [%s]", data->topic_len, data->topic, in_buffer.data);
-              // Repost string to main event loop
-              eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_INCOMING_DATA, &in_buffer, sizeof(in_buffer), portMAX_DELAY);
-              ledSysActivity();
-            };
+            in_buffer.topic_len = data->topic_len;
+            in_buffer.data_len = data->total_data_len;
+            rlog_d(logTAG, "Incoming message \"%.*s\": [%s]", data->topic_len, data->topic, in_buffer.data);
+            // Repost string to main event loop
+            eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_INCOMING_DATA, &in_buffer, sizeof(in_buffer), portMAX_DELAY);
+            ledSysActivity();
           };
         };
       };
       break;
     
     case MQTT_EVENT_ERROR:
-      memcpy(&_mqttData.err_codes, data->error_handle, sizeof(_mqttData.err_codes));
-      // Generate error message
-      if (data) {
+      if (event_data) {
+        memcpy(&_mqttData.err_codes, data->error_handle, sizeof(_mqttData.err_codes));
+        // Generate error message
         if (data->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
           str_value = malloc_stringf("transport error %d (%s) | ESP_TLS error code: 0x%x | TLS stack error: 0x%x", 
             data->error_handle->esp_transport_sock_errno, strerror(data->error_handle->esp_transport_sock_errno),
