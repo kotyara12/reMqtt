@@ -50,7 +50,7 @@ static uint32_t _mqttBackToPrimarty = 0;
 
 bool mqttIsConnected() 
 {
-  return wifiIsConnected() && _mqttData.connected;
+  return wifiIsConnected() && (_mqttState == MQTT_CLIENT_STARTED) && _mqttData.connected;
 }
 
 void mqttErrorEventSend(char* message)
@@ -352,7 +352,7 @@ bool mqttUnsubscribe(const char *topic)
 
 bool mqttPublish(char *topic, char *payload, int qos, bool retained, bool forced, bool free_topic, bool free_payload)
 {
-  if ((topic) && (_mqttData.connected)) {
+  if ((topic) && _mqttData.connected) {
     int msg_id;
     if (payload) {
       if (forced) {
@@ -406,7 +406,9 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
     case MQTT_EVENT_BEFORE_CONNECT:
       _mqttData.conn_attempt++;
       rlog_i(logTAG, "Attempt # %d to connect to MQTT broker [ %s : %d ]...", _mqttData.conn_attempt, _mqttData.host, _mqttData.port);
+      #if CONFIG_SYSLED_MQTT_ACTIVITY
       ledSysActivity();
+      #endif // CONFIG_SYSLED_MQTT_ACTIVITY
     break;
 
     case MQTT_EVENT_CONNECTED:
@@ -452,13 +454,16 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
     case MQTT_EVENT_UNSUBSCRIBED:
     case MQTT_EVENT_PUBLISHED:
       mqttErrorEventClear();
+      #if CONFIG_SYSLED_MQTT_ACTIVITY
       ledSysActivity();
+      #endif // CONFIG_SYSLED_MQTT_ACTIVITY
       break;
     
     case MQTT_EVENT_DATA:
       if (event_data) {
         if (data->current_data_offset == 0) {
           if (in_buffer.topic) free(in_buffer.topic);
+          in_buffer.topic = nullptr;
           if (in_buffer.data) free(in_buffer.data);
           in_buffer.data = (char*)esp_calloc(1, data->total_data_len+1);
         };
@@ -466,12 +471,16 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
           memcpy(in_buffer.data+data->current_data_offset, data->data, data->data_len);
           if (data->current_data_offset + data->data_len == data->total_data_len) {
             in_buffer.topic = malloc_stringl(data->topic, data->topic_len);
-            in_buffer.topic_len = data->topic_len;
-            in_buffer.data_len = data->total_data_len;
-            rlog_d(logTAG, "Incoming message \"%.*s\": [%s]", data->topic_len, data->topic, in_buffer.data);
-            // Repost string to main event loop
-            eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_INCOMING_DATA, &in_buffer, sizeof(in_buffer), portMAX_DELAY);
-            ledSysActivity();
+            if (in_buffer.topic) {
+              in_buffer.topic_len = data->topic_len;
+              in_buffer.data_len = data->total_data_len;
+              rlog_d(logTAG, "Incoming message \"%.*s\": [%s]", data->topic_len, data->topic, in_buffer.data);
+              // Repost string to main event loop
+              eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_INCOMING_DATA, &in_buffer, sizeof(in_buffer), portMAX_DELAY);
+              #if CONFIG_SYSLED_MQTT_ACTIVITY
+              ledSysActivity();
+              #endif // CONFIG_SYSLED_MQTT_ACTIVITY
+            };
           };
         };
       };
@@ -496,7 +505,9 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
         mqttErrorEventSend(str_value);
         if (str_value) rlog_e(logTAG, "MQTT client error: %s", str_value);
       };
+      #if CONFIG_SYSLED_MQTT_ACTIVITY
       ledSysActivity();
+      #endif // CONFIG_SYSLED_MQTT_ACTIVITY
       break;
 
     default:
@@ -685,6 +696,9 @@ bool mqttStart()
   #else
     mqttSetConfigPrimary(&_mqttCfg);
   #endif // CONFIG_MQTT2_TYPE
+
+  RE_MEM_CHECK(logTAG, _mqttCfg.host, return false);
+  RE_MEM_CHECK(logTAG, _mqttCfg.lwt_topic, return false);
     
   // Launching the client
   _mqttClient = esp_mqtt_client_init(&_mqttCfg);
@@ -748,6 +762,7 @@ bool mqttTaskSuspend()
       return false;
     };
     
+    _mqttData.connected = false;
     _mqttState = MQTT_CLIENT_SUSPENDED;
     rlog_d(logTAG, "Task [ MQTT_CLIENT ] was stopped");
     return true;
