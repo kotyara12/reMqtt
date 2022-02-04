@@ -50,7 +50,7 @@ static uint32_t _mqttBackToPrimarty = 0;
 
 bool mqttIsConnected() 
 {
-  return wifiIsConnected() && (_mqttState == MQTT_CLIENT_STARTED) && _mqttData.connected;
+  return wifiIsConnected() && _mqttData.connected;
 }
 
 void mqttErrorEventSend(char* message)
@@ -726,6 +726,7 @@ bool mqttTaskStart(bool createSuspended)
 bool mqttTaskStop()
 {
   if (_mqttClient) {
+    mqttTaskSuspend();
     esp_err_t err = esp_mqtt_client_destroy(_mqttClient);
     if (err != ESP_OK) {
       rlog_e(logTAG, "Failed to destroy MQTT client!");
@@ -736,6 +737,7 @@ bool mqttTaskStop()
     _mqttState = MQTT_CLIENT_STOPPED;
     _mqttData.connected = false;
     _mqttData.conn_attempt = 0;
+    eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_LOST, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
 
     if (_mqttData.host) {
       free(_mqttData.host);
@@ -764,6 +766,7 @@ bool mqttTaskSuspend()
     
     _mqttData.connected = false;
     _mqttState = MQTT_CLIENT_SUSPENDED;
+    eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_LOST, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
     rlog_d(logTAG, "Task [ MQTT_CLIENT ] was stopped");
     return true;
   };
