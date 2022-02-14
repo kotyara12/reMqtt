@@ -414,7 +414,6 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
     case MQTT_EVENT_CONNECTED:
       _mqttData.connected = true;
       _mqttData.conn_attempt = 0;
-      memset(&_mqttData.err_codes, 0, sizeof(_mqttData.err_codes));
       rlog_i(logTAG, "Connection to MQTT broker [ %s : %d ] established", _mqttData.host, _mqttData.port);
       // Repost event to main event loop
       eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONNECTED, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
@@ -488,7 +487,6 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
     
     case MQTT_EVENT_ERROR:
       if (event_data) {
-        memcpy(&_mqttData.err_codes, data->error_handle, sizeof(_mqttData.err_codes));
         // Generate error message
         if (data->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
           str_value = malloc_stringf("transport error %d (%s) | ESP_TLS error code: 0x%x | TLS stack error: 0x%x", 
