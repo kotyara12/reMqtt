@@ -352,10 +352,10 @@ bool mqttUnsubscribe(const char *topic)
 
 bool mqttPublish(char *topic, char *payload, int qos, bool retained, bool forced, bool free_topic, bool free_payload)
 {
-  if ((topic) && _mqttData.connected) {
+  if (topic && _mqttData.connected) {
     int msg_id;
     if (payload) {
-      if (forced) {
+      if (forced || (strlen(payload) > CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE) || (esp_mqtt_client_get_outbox_size(_mqttClient) >= CONFIG_MQTT_MAX_OUTBOX_SIZE)) {
         msg_id = esp_mqtt_client_publish(_mqttClient, topic, payload, strlen(payload), qos, retained);
       } else {
         msg_id = esp_mqtt_client_enqueue(_mqttClient, topic, payload, strlen(payload), qos, retained, true);
@@ -370,7 +370,7 @@ bool mqttPublish(char *topic, char *payload, int qos, bool retained, bool forced
       if (free_topic) free(topic);
       if (free_payload) free(payload);
     } else {
-      if (forced) {
+      if (forced || (esp_mqtt_client_get_outbox_size(_mqttClient) >= CONFIG_MQTT_MAX_OUTBOX_SIZE)) {
         msg_id = esp_mqtt_client_publish(_mqttClient, topic, payload, 0, qos, retained);
       } else {
         msg_id = esp_mqtt_client_enqueue(_mqttClient, topic, payload, 0, qos, retained, true);
