@@ -127,6 +127,7 @@ bool mqttServer1isLocal()
 
 bool mqttServer1Enabled()
 {
+  // rlog_d(logTAG, "mqttServer1Enabled(): _mqttServer1Available=%d, _mqttInternetAvailable=%d", _mqttServer1Available, _mqttInternetAvailable);
   return _mqttServer1Available && (_mqttInternetAvailable || mqttServer1isLocal());
 }
 
@@ -260,7 +261,7 @@ bool mqttServerSelectAuto()
 }
 
 // Server status change (by ping)
-bool mqttServer2SetAvailable(const bool newAvailable)
+bool mqttServer2SetAvailable(bool newAvailable)
 {
   if (_mqttServer2Available != newAvailable) {
     _mqttServer2Available = newAvailable;
@@ -293,7 +294,7 @@ bool mqttServerSelectAuto()
 #endif // CONFIG_MQTT2_TYPE
 
 // Server status change (by ping)
-bool mqttServer1SetAvailable(const bool newAvailable)
+bool mqttServer1SetAvailable(bool newAvailable)
 {
   if (_mqttServer1Available != newAvailable) {
     _mqttServer1Available = newAvailable;
@@ -303,13 +304,16 @@ bool mqttServer1SetAvailable(const bool newAvailable)
 }
 
 // Server status change (by internet)
-bool mqttServerSelectInet(const bool internetAvailable)
+bool mqttServerSelectInet(bool internetAvailable, bool updateServers)
 {
-  if (_mqttInternetAvailable != internetAvailable) {
-    _mqttInternetAvailable = internetAvailable;
-    return mqttServerSelectAuto();
+  _mqttInternetAvailable = internetAvailable;
+  if (updateServers) {
+    _mqttServer1Available = internetAvailable || mqttServer1isLocal();
+    #ifdef CONFIG_MQTT2_TYPE
+    _mqttServer2Available = internetAvailable || mqttServer2isLocal();
+    #endif // CONFIG_MQTT2_TYPE
   };
-  return false;
+  return mqttServerSelectAuto();
 }
 
 // -----------------------------------------------------------------------------------------------------------------------
@@ -754,7 +758,7 @@ bool mqttTaskStop()
 
 bool mqttTaskSuspend()
 {
-  if (_mqttClient) {
+  if (_mqttClient && (_mqttState == MQTT_CLIENT_STARTED)) {
     esp_err_t err = esp_mqtt_client_stop(_mqttClient);
     if (err != ESP_OK) {
       rlog_e(logTAG, "Failed to stop MQTT client!");
@@ -765,7 +769,7 @@ bool mqttTaskSuspend()
     _mqttData.connected = false;
     _mqttState = MQTT_CLIENT_SUSPENDED;
     eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_LOST, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
-    rlog_d(logTAG, "Task [ MQTT_CLIENT ] was stopped");
+    rlog_i(logTAG, "Task [ MQTT_CLIENT ] was stopped");
     return true;
   };
   return false;
@@ -773,7 +777,7 @@ bool mqttTaskSuspend()
 
 bool mqttTaskResume()
 {
-  if (_mqttClient) {
+  if (_mqttClient && (_mqttState != MQTT_CLIENT_STARTED)) {
     esp_err_t err = esp_mqtt_client_start(_mqttClient);
     if (err != ESP_OK) {
       rlog_e(logTAG, "Failed to start MQTT client!");
@@ -782,7 +786,7 @@ bool mqttTaskResume()
     };
     
     _mqttState = MQTT_CLIENT_STARTED;
-    rlog_d(logTAG, "Task [ MQTT_CLIENT ] was started");
+    rlog_i(logTAG, "Task [ MQTT_CLIENT ] was started");
     return true;
   };
   return false;
@@ -796,18 +800,22 @@ static void mqttWiFiEventHandler(void* arg, esp_event_base_t event_base, int32_t
 {
   // STA connected, Internet access not checked
   if (event_id == RE_WIFI_STA_GOT_IP) {
-    mqttServerSelectInet(false);
+    rlog_d(logTAG, "Event received: RE_WIFI_STA_GOT_IP");
+    mqttServerSelectInet(false, true);
   }
   // STA connected and Internet access is available
   else if (event_id == RE_WIFI_STA_PING_OK) {
-    mqttServerSelectInet(true);
+    rlog_d(logTAG, "Event received: RE_WIFI_STA_PING_OK");
+    mqttServerSelectInet(true, true);
   }
   // Internet access lost
   else if (event_id == RE_WIFI_STA_PING_FAILED) {
-    mqttServerSelectInet(false);
+    rlog_d(logTAG, "Event received: RE_WIFI_STA_PING_FAILED");
+    mqttServerSelectInet(false, true);
   }
   // STA disconnected
   else if ((event_id == RE_WIFI_STA_DISCONNECTED) || (event_id == RE_WIFI_STA_STOPPED)) {
+    rlog_d(logTAG, "Event received: RE_WIFI_STA_DISCONNECTED");
     if (_mqttState == MQTT_CLIENT_STARTED) {
       mqttTaskSuspend();
     };
@@ -845,10 +853,12 @@ static void mqttPing1EventHandler(void* arg, esp_event_base_t event_base, int32_
 
   // Broker 1 is available
   if (event_id == RE_PING_MQTT1_AVAILABLE) {
+    rlog_d(logTAG, "Event received: RE_PING_MQTT1_AVAILABLE");
     mqttServer1SetAvailable(true);
   }
   // Broker 1 is unavailable
   else if (event_id == RE_PING_MQTT1_UNAVAILABLE) {
+    rlog_d(logTAG, "Event received: RE_PING_MQTT1_UNAVAILABLE");
     mqttServer1SetAvailable(false);
   }
 }
@@ -862,10 +872,12 @@ static void mqttPing2EventHandler(void* arg, esp_event_base_t event_base, int32_
 
   // Broker 2 is available
   if (event_id == RE_PING_MQTT2_AVAILABLE) {
+    rlog_d(logTAG, "Event received: RE_PING_MQTT2_AVAILABLE");
     mqttServer2SetAvailable(true);
   }
   // Broker 2 is unavailable
   else if (event_id == RE_PING_MQTT2_UNAVAILABLE) {
+    rlog_d(logTAG, "Event received: RE_PING_MQTT2_UNAVAILABLE");
     mqttServer2SetAvailable(false);
   }
 }
@@ -873,6 +885,7 @@ static void mqttPing2EventHandler(void* arg, esp_event_base_t event_base, int32_
 
 bool mqttEventHandlerRegister()
 {
+  rlog_d(logTAG, "Register MQTT event handlers...");
   return eventHandlerRegister(RE_WIFI_EVENTS, ESP_EVENT_ANY_ID, &mqttWiFiEventHandler, nullptr) 
       #if defined(CONFIG_MQTT1_PING_CHECK) && CONFIG_MQTT1_PING_CHECK
       && eventHandlerRegister(RE_PING_EVENTS, RE_PING_MQTT1_AVAILABLE, &mqttPing1EventHandler, nullptr)
