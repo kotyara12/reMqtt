@@ -538,6 +538,10 @@ void mqttSetConfigPrimary(esp_mqtt_client_config_t * mqttCfg)
   #else
     _mqttData.local = true;
   #endif // CONFIG_MQTT1_TYPE == 0
+  if (_mqttData.host) {
+    free(_mqttData.host);
+    _mqttData.host = nullptr;
+  };
   #if CONFIG_MQTT1_TYPE == 2
     _mqttData.host = wifiGetGatewayIP();
   #else
@@ -607,6 +611,10 @@ void mqttSetConfigReserved(esp_mqtt_client_config_t * mqttCfg)
   #else
     _mqttData.local = true;
   #endif // CONFIG_MQTT2_TYPE == 0
+  if (_mqttData.host) {
+    free(_mqttData.host);
+    _mqttData.host = nullptr;
+  };
   #if CONFIG_MQTT2_TYPE == 2
     _mqttData.host = wifiGetGatewayIP();
   #else
@@ -674,7 +682,7 @@ void mqttSetConfigReserved(esp_mqtt_client_config_t * mqttCfg)
     if (!(a)) {                                             \
       rlog_e(logTAG, msg);                                  \
       eventLoopPostSystem(RE_SYS_ERROR, RE_SYS_SET, false); \
-      return false;                                         \
+      return false;                                           \
     }                                                       \
   } while (0)
 
@@ -700,7 +708,9 @@ bool mqttStart()
   #endif // CONFIG_MQTT2_TYPE
 
   RE_MEM_CHECK(logTAG, _mqttCfg.host, return false);
-  RE_MEM_CHECK(logTAG, _mqttCfg.lwt_topic, return false);
+  #if CONFIG_MQTT_STATUS_LWT
+    RE_MEM_CHECK(logTAG, _mqttCfg.lwt_topic, return false);
+  #endif // CONFIG_MQTT_STATUS_LWT
     
   // Launching the client
   _mqttClient = esp_mqtt_client_init(&_mqttCfg);
