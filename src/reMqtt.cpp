@@ -707,9 +707,9 @@ bool mqttStart()
     mqttSetConfigPrimary(&_mqttCfg);
   #endif // CONFIG_MQTT2_TYPE
 
-  RE_MEM_CHECK(logTAG, _mqttCfg.host, return false);
+  RE_MEM_CHECK(_mqttCfg.host, return false);
   #if CONFIG_MQTT_STATUS_LWT
-    RE_MEM_CHECK(logTAG, _mqttCfg.lwt_topic, return false);
+    RE_MEM_CHECK(_mqttCfg.lwt_topic, return false);
   #endif // CONFIG_MQTT_STATUS_LWT
     
   // Launching the client
