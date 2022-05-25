@@ -21,15 +21,6 @@ static const char* logTAG = "MQTT";
 
 #define MQTT_LOG_PAYLOAD_LIMIT 2048
 
-#if defined(CONFIG_MQTT1_TYPE) & defined(CONFIG_MQTT1_TLS_ENABLED) & CONFIG_MQTT1_TLS_ENABLED
-extern const uint8_t mqtt1_broker_pem_start[] asm(CONFIG_MQTT1_TLS_PEM_START);
-extern const uint8_t mqtt1_broker_pem_end[]   asm(CONFIG_MQTT1_TLS_PEM_END); 
-#endif // CONFIG_MQTT1_TLS_ENABLED
-#if defined(CONFIG_MQTT2_TYPE) & defined(CONFIG_MQTT2_TLS_ENABLED) & CONFIG_MQTT2_TLS_ENABLED
-extern const uint8_t mqtt2_broker_pem_start[] asm(CONFIG_MQTT2_TLS_PEM_START);
-extern const uint8_t mqtt2_broker_pem_end[]   asm(CONFIG_MQTT2_TLS_PEM_END); 
-#endif // CONFIG_MQTT2_TLS_ENABLED
-
 typedef enum {
   MQTT_CLIENT_STOPPED   = 0,
   MQTT_CLIENT_STARTED   = 1,
@@ -554,7 +545,7 @@ void mqttSetConfigPrimary(esp_mqtt_client_config_t * mqttCfg)
     _mqttData.port = CONFIG_MQTT1_PORT_TLS;
     mqttCfg->transport = MQTT_TRANSPORT_OVER_SSL;
     mqttCfg->port = CONFIG_MQTT1_PORT_TLS;
-    mqttCfg->cert_pem = (const char *)mqtt1_broker_pem_start;
+    mqttCfg->use_global_ca_store = true;
     mqttCfg->skip_cert_common_name_check = (CONFIG_MQTT1_TLS_NAME_CHECK == 0);
   #else
     _mqttData.port = CONFIG_MQTT1_PORT_TCP;
@@ -627,8 +618,8 @@ void mqttSetConfigReserved(esp_mqtt_client_config_t * mqttCfg)
     _mqttData.port = CONFIG_MQTT2_PORT_TLS;
     mqttCfg->transport = MQTT_TRANSPORT_OVER_SSL;
     mqttCfg->port = CONFIG_MQTT2_PORT_TLS;
-    mqttCfg->cert_pem = (const char *)mqtt2_broker_pem_start;
-    mqttCfg->skip_cert_common_name_check = CONFIG_MQTT2_TLS_NAME_CHECK;
+    mqttCfg->use_global_ca_store = true;
+    mqttCfg->skip_cert_common_name_check = (CONFIG_MQTT2_TLS_NAME_CHECK == 0);
   #else
     _mqttData.port = CONFIG_MQTT2_PORT_TCP;
     mqttCfg->transport = MQTT_TRANSPORT_OVER_TCP;
