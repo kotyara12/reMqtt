@@ -43,10 +43,12 @@ void  mqttTopicStatusFree();
 
 bool mqttTaskStart(bool createSuspended);
 bool mqttTaskFree();
+bool mqttTaskRestart();
 
 bool mqttEventHandlerRegister();
 
 bool mqttIsConnected();
+int  mqttGetOutboxSize();
 bool mqttSubscribe(const char *topic, int qos);
 bool mqttUnsubscribe(const char *topic);
 esp_err_t mqttPublish(char *topic, char *payload, int qos, bool retained, bool free_topic, bool free_payload);

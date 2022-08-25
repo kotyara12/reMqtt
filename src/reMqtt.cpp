@@ -147,6 +147,15 @@ bool mqttIsConnected()
   return wifiIsConnected() && _mqttData.connected;
 }
 
+int mqttGetOutboxSize()
+{
+  #if CONFIG_MQTT_USE_LWMQTT_CLIENT
+    return 0;
+  #else
+    return esp_mqtt_client_get_outbox_size(_mqttClient);
+  #endif // CONFIG_MQTT_USE_LWMQTT_CLIENT
+}
+
 void mqttErrorEventSend(char* message)
 {
   _mqttError = true;
@@ -1614,6 +1623,11 @@ bool mqttTaskFree()
   return ret;
 }
 
+bool mqttTaskRestart()
+{
+  return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_RESTART, nullptr, 0, portMAX_DELAY);
+}
+
 // -----------------------------------------------------------------------------------------------------------------------
 // -------------------------------------------------- WiFi event handler -------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
@@ -1646,7 +1660,7 @@ static void mqttWiFiEventHandler(void* arg, esp_event_base_t event_base, int32_t
 
 static void mqttSelfEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
-  if ((event_id == RE_MQTT_SERVER_PRIMARY) || (event_id == RE_MQTT_SERVER_RESERVED)) {
+  if ((event_id == RE_MQTT_RESTART) || (event_id == RE_MQTT_SERVER_PRIMARY) || (event_id == RE_MQTT_SERVER_RESERVED)) {
     mqttClientStop();
     vTaskDelay(pdMS_TO_TICKS(1000));
     mqttClientStart();
@@ -1718,6 +1732,7 @@ bool mqttEventHandlerRegister()
       && eventHandlerRegister(RE_PING_EVENTS, RE_PING_MQTT2_UNAVAILABLE, &mqttPing2EventHandler, nullptr)
       #endif // CONFIG_MQTT2_PING_CHECK
       && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_SERVER_PRIMARY, &mqttSelfEventHandler, nullptr)
-      && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, &mqttSelfEventHandler, nullptr);
+      && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, &mqttSelfEventHandler, nullptr)
+      && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_RESTART, &mqttSelfEventHandler, nullptr);
 }
 
