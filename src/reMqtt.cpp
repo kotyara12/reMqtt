@@ -7,6 +7,10 @@ static const char* logTAG = "MQTT";
 
 #define MQTT_LOG_PAYLOAD_LIMIT 2048
 
+#if (defined(CONFIG_MQTT1_TYPE) && CONFIG_MQTT1_TLS_ENABLED && (CONFIG_MQTT1_TLS_STORAGE == TLS_CERT_BUNDLE)) || (defined(CONFIG_MQTT2_TYPE) && CONFIG_MQTT2_TLS_ENABLED && (CONFIG_MQTT2_TLS_STORAGE == TLS_CERT_BUNDLE))
+  #include "esp_crt_bundle.h"
+#endif // TLS_CERT_BUNDLE
+
 #if defined(CONFIG_MQTT1_TYPE) && CONFIG_MQTT1_TLS_ENABLED && !defined(CONFIG_MQTT1_TLS_STORAGE)
   #define CONFIG_MQTT1_TLS_STORAGE TLS_CERT_BUFFER
 #endif // CONFIG_MQTT1_TLS_STORAGE
@@ -24,10 +28,6 @@ static const char* logTAG = "MQTT";
   extern const uint8_t mqtt2_broker_pem_end[]   asm(CONFIG_MQTT2_TLS_PEM_END); 
 #endif // CONFIG_MQTT2_TLS_ENABLED
 
-#if (defined(CONFIG_MQTT1_TYPE) && CONFIG_MQTT1_TLS_ENABLED && (CONFIG_MQTT1_TLS_STORAGE == TLS_CERT_BUNDLE)) || (defined(CONFIG_MQTT2_TYPE) && CONFIG_MQTT2_TLS_ENABLED && (CONFIG_MQTT2_TLS_STORAGE == TLS_CERT_BUNDLE))
-  #include "esp_crt_bundle.h"
-#endif // TLS_CERT_BUNDLE
-
 typedef enum {
   MQTT_CLIENT_STOPPED   = 0,
   MQTT_CLIENT_STARTED   = 1,
@@ -37,10 +37,88 @@ typedef enum {
 static re_mqtt_event_data_t _mqttData;
 static mqtt_client_state_t _mqttState = MQTT_CLIENT_STOPPED;
 static bool _mqttError = false;
-#if defined(CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES) && (CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0)
-  static uint32_t _mqttBackToPrimarty = 0;
-#endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
 static esp_mqtt_client_handle_t _mqttClient = nullptr;
+
+// -----------------------------------------------------------------------------------------------------------------------
+// --------------------------------------------- Return to main server timer ---------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------
+
+#if defined(CONFIG_MQTT2_TYPE) && defined(CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES) && (CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0)
+
+#include "esp_timer.h"
+
+esp_timer_handle_t _mqttBackToPrimaryTimer = nullptr;
+
+bool mqttServer1SetAvailable(bool newAvailable);
+void mqttBackToPrimaryTimerEnd(void* arg)
+{
+  mqttServer1SetAvailable(true); 
+}
+
+bool mqttBackToPrimaryTimerInit()
+{
+  if (_mqttBackToPrimaryTimer == nullptr) {
+    esp_timer_create_args_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.name = "mqtt_b2p";
+    cfg.skip_unhandled_events = false;
+    cfg.callback = mqttBackToPrimaryTimerEnd;
+    RE_OK_CHECK(esp_timer_create(&cfg, &_mqttBackToPrimaryTimer), return false);
+  };
+  return true;
+}
+
+bool mqttBackToPrimaryTimerStop()
+{
+  if ((_mqttBackToPrimaryTimer != nullptr) && esp_timer_is_active(_mqttBackToPrimaryTimer)) {
+    RE_OK_CHECK(esp_timer_stop(_mqttBackToPrimaryTimer), return false);
+  };  
+  return true;
+}
+
+bool mqttBackToPrimaryTimerFree()
+{
+  if (_mqttBackToPrimaryTimer != nullptr) {
+    mqttBackToPrimaryTimerStop();
+    RE_OK_CHECK(esp_timer_delete(_mqttBackToPrimaryTimer), return false);
+  };
+  return true;
+}
+
+bool mqttBackToPrimaryTimerStart()
+{
+  if (_mqttBackToPrimaryTimer == nullptr) {
+    if (!mqttBackToPrimaryTimerInit()) {
+      return false;
+    };
+  };
+  RE_OK_CHECK(esp_timer_start_once(_mqttBackToPrimaryTimer, 60000000UL*CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES), return false);
+  return true;
+}
+
+#else
+
+bool mqttBackToPrimaryTimerInit()
+{
+  return true;
+}
+
+bool mqttBackToPrimaryTimerFree()
+{
+  return true;
+}
+
+bool mqttBackToPrimaryTimerStart()
+{
+  return true;
+}
+
+bool mqttBackToPrimaryTimerStop()
+{
+  return true;
+}
+
+#endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
 
 // -----------------------------------------------------------------------------------------------------------------------
 // ----------------------------------------------------- Utilites --------------------------------------------------------
@@ -148,7 +226,6 @@ bool mqttServer1Enabled()
 
 static bool _mqttPrimary = true;
 static bool _mqttServer2Available = true;
-static time_t _mqttServer2Activate = 0;
 
 bool mqttServer2isLocal()
 {
@@ -160,55 +237,35 @@ bool mqttServer2Enabled()
   return _mqttServer2Available && (_mqttInternetAvailable || mqttServer2isLocal());
 }
 
-#if defined(CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES) && (CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0)
-static void mqttTimeEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
-#endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
-
 bool mqttServer1Start()
 {
   _mqttPrimary = true;
-  _mqttServer2Activate = 0;
   rlog_i(logTAG, "Primary MQTT broker selected");
-  #if defined(CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES) && (CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0)
-    _mqttBackToPrimarty = 0;
-    eventHandlerUnregister(RE_TIME_EVENTS, RE_TIME_EVERY_MINUTE, &mqttTimeEventHandler);
-  #endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
+  mqttBackToPrimaryTimerStop();
   return mqttClientStart();
 }
 
 bool mqttServer2Start()
 {
   _mqttPrimary = false;
-  _mqttServer2Activate = time(nullptr);
   rlog_i(logTAG, "Reserved MQTT broker selected");
-  #if defined(CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES) && (CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0)
-    _mqttBackToPrimarty = 0;
-    eventHandlerRegister(RE_TIME_EVENTS, RE_TIME_EVERY_MINUTE, &mqttTimeEventHandler, nullptr);
-  #endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
+  mqttBackToPrimaryTimerStart();
   return mqttClientStart();
 }
 
 bool mqttServer1Select()
 {
   _mqttPrimary = true;
-  _mqttServer2Activate = 0;
   rlog_w(logTAG, "Switching to primary MQTT broker");
-  #if defined(CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES) && (CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0)
-    _mqttBackToPrimarty = 0;
-    eventHandlerUnregister(RE_TIME_EVENTS, RE_TIME_EVERY_MINUTE, &mqttTimeEventHandler);
-  #endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
+  mqttBackToPrimaryTimerStop();
   return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SERVER_PRIMARY, nullptr, 0, portMAX_DELAY);
 }
 
 bool mqttServer2Select()
 {
   _mqttPrimary = false;
-  _mqttServer2Activate = time(nullptr);
   rlog_w(logTAG, "Switching to reserved MQTT broker");
-  #if defined(CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES) && (CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0)
-    _mqttBackToPrimarty = 0;
-    eventHandlerRegister(RE_TIME_EVENTS, RE_TIME_EVERY_MINUTE, &mqttTimeEventHandler, nullptr);
-  #endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
+  mqttBackToPrimaryTimerStart();
   return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, nullptr, 0, portMAX_DELAY);
 }
 
@@ -842,7 +899,7 @@ bool mqttClientStop()
 
 bool mqttTaskInit()
 {
-  return true;
+  return mqttBackToPrimaryTimerInit();
 }
 
 bool mqttTaskStart(bool createSuspended)
@@ -856,8 +913,7 @@ bool mqttTaskStart(bool createSuspended)
 
 bool mqttTaskFree()
 {
-  bool ret = mqttClientStop();
-  return ret;
+  return mqttClientStop() && mqttBackToPrimaryTimerFree();
 }
 
 bool mqttTaskRestart()
@@ -903,20 +959,6 @@ static void mqttSelfEventHandler(void* arg, esp_event_base_t event_base, int32_t
     mqttClientStart();
   };
 }
-
-#if defined(CONFIG_MQTT2_TYPE) && defined(CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES) && (CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES > 0)
-static void mqttTimeEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
-{
-  if (event_id == RE_TIME_EVERY_MINUTE) {
-    _mqttBackToPrimarty++;
-    if (_mqttBackToPrimarty >= CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES) {
-      _mqttBackToPrimarty = 0;
-      rlog_i(logTAG, "Attempting to switch to the primary server...");
-      mqttServer1SetAvailable(true);
-    };
-  };
-}
-#endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
 
 #if defined(CONFIG_MQTT1_PING_CHECK) && CONFIG_MQTT1_PING_CHECK
 static void mqttPing1EventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
