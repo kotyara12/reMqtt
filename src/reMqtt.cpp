@@ -134,21 +134,36 @@ int mqttGetOutboxSize()
   return esp_mqtt_client_get_outbox_size(_mqttClient);
 }
 
-void mqttErrorEventSend(char* message)
+void mqttErrorEventSend(const char* message, const char* object)
 {
   _mqttError = true;
   if (message) {
-    eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR, (void*)message, strlen(message)+1, portMAX_DELAY);
+    if (object) {
+      char* err_msg = malloc_stringf(message, object);
+      if (err_msg) {
+        eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR, (void*)err_msg, strlen(err_msg)+1, portMAX_DELAY);
+        free(err_msg);
+      };
+    } else {
+      eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR, (void*)message, strlen(message)+1, portMAX_DELAY);
+    };
   } else {
     eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR, nullptr, 0, portMAX_DELAY);
   };
 }
 
-void mqttErrorEventSendCode(const char* message, esp_err_t error_code)
+void mqttErrorEventSendCode(const char* message, const char* object, esp_err_t error_code)
 {
-  char* err_msg = malloc_stringf(message, error_code, esp_err_to_name(error_code));
-  mqttErrorEventSend(err_msg);
-  if (err_msg != nullptr) free(err_msg);
+  char* err_msg = nullptr;
+  if (object) {
+    err_msg = malloc_stringf(message, object, error_code, esp_err_to_name(error_code));
+  } else {
+    err_msg = malloc_stringf(message, error_code, esp_err_to_name(error_code));
+  };
+  if (err_msg) {
+    eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR, (void*)err_msg, strlen(err_msg)+1, portMAX_DELAY);
+    free(err_msg);
+  };
 }
 
 void mqttErrorEventClear()
@@ -391,34 +406,28 @@ bool mqttServerSelectInet(bool internetAvailable, bool updateServers)
 bool mqttSubscribe(const char *topic, int qos)
 {
   if (_mqttData.connected && (topic != nullptr)) {
-    int msg_id = esp_mqtt_client_subscribe(_mqttClient, topic, qos);
-    if (msg_id == -1) {
+    if (esp_mqtt_client_subscribe(_mqttClient, topic, qos) == -1) {
       rlog_e(logTAG, "Failed to subscribe to topic \"%s\"", topic);
-      mqttErrorEventSend(nullptr);
+      mqttErrorEventSend("Failed to subscribe to topic \"%s\"", topic);
       return false;
     };
-    
     rlog_i(logTAG, "Subscribed to: \"%s\"", topic);
     return true;
   };
-  
   return false;
 }
 
 bool mqttUnsubscribe(const char *topic)
 {
   if (_mqttData.connected && (topic != nullptr)) {
-    int msg_id = esp_mqtt_client_unsubscribe(_mqttClient, topic);
-    if (msg_id == -1) {
+    if (esp_mqtt_client_unsubscribe(_mqttClient, topic) == -1) {
       rlog_e(logTAG, "Failed to unsubscribe from topic \"%s\"", topic);
-      mqttErrorEventSend(nullptr);
+      mqttErrorEventSend("Failed to unsubscribe from topic \"%s\"", topic);
       return false;
     };
-    
     rlog_i(logTAG, "Unsubscribed from: \"%s\"", topic);
     return true;
   };
-
   return false;
 }
 
@@ -438,14 +447,26 @@ esp_err_t mqttPublish(char *topic, char *payload, int qos, bool retained, bool f
       payload_len = strlen(payload);
     };
 
+    #if defined(CONFIG_MQTT_MAX_OUTBOX_SIZE) && (CONFIG_MQTT_MAX_OUTBOX_SIZE > 0)
+      bool _enqueueOutbox = esp_mqtt_client_get_outbox_size(_mqttClient) < CONFIG_MQTT_MAX_OUTBOX_SIZE;
+    #else
+      bool _enqueueOutbox = true;
+    #endif // CONFIG_MQTT_MAX_OUTBOX_SIZE
+
+    #if defined(CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE) && (CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE > 0)
+      bool _enqueueMessage = payload_len < CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE;
+    #else
+      bool _enqueueMessage = true;
+    #endif // CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE
+
     if (_mqttData.connected) {
-      if ((payload_len < CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE) && (esp_mqtt_client_get_outbox_size(_mqttClient) < CONFIG_MQTT_MAX_OUTBOX_SIZE)) {
+      if (_enqueueOutbox && _enqueueMessage) {
         esp_mqtt_client_enqueue(_mqttClient, topic, payload, payload_len, qos, retained, true) > -1 ? err = ESP_OK : err = ESP_FAIL;
       } else {
         esp_mqtt_client_publish(_mqttClient, topic, payload, payload_len, qos, retained) > -1 ? err = ESP_OK : err = ESP_FAIL;
       };
     } else {
-      if ((payload_len < CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE) && (esp_mqtt_client_get_outbox_size(_mqttClient) < CONFIG_MQTT_MAX_OUTBOX_SIZE)) {
+      if (_enqueueOutbox && _enqueueMessage) {
         esp_mqtt_client_enqueue(_mqttClient, topic, payload, payload_len, qos, retained, true) > -1 ? err = ESP_OK : err = ESP_FAIL;
       } else {
         err = ESP_ERR_INVALID_STATE;
@@ -462,7 +483,7 @@ esp_err_t mqttPublish(char *topic, char *payload, int qos, bool retained, bool f
       };
     } else {
       rlog_e(logTAG, "Failed to publish to topic \"%s\": %d, %s", topic, err, esp_err_to_name(err));
-      mqttErrorEventSend(nullptr);
+      mqttErrorEventSendCode("Failed to publish to topic \"%s\": %d, %s", topic, err);
     };
   };
 
@@ -488,7 +509,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
       _mqttData.conn_attempt++;
       rlog_i(logTAG, "Attempt # %d to connect to MQTT broker [ %s : %d ]...", _mqttData.conn_attempt, _mqttData.host, _mqttData.port);
       #if CONFIG_SYSLED_MQTT_ACTIVITY
-      ledSysActivity();
+        ledSysActivity();
       #endif // CONFIG_SYSLED_MQTT_ACTIVITY
     break;
 
@@ -507,7 +528,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
       break;
 
     case MQTT_EVENT_DISCONNECTED:
-      mqttErrorEventSend(nullptr);
+      mqttErrorEventSend(nullptr, nullptr);
       if (_mqttData.connected) {
         // The connection has already been established before, the connection is lost
         _mqttData.connected = false;
@@ -571,18 +592,18 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
       if (event_data) {
         // Generate error message
         if (data->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-          str_value = malloc_stringf("transport error %d (%s) | ESP_TLS error code: 0x%x | TLS stack error: 0x%x", 
+          str_value = malloc_stringf("Transport error: %d (%s)\nESP_TLS error code: 0x%x\nTLS stack error: 0x%x", 
             data->error_handle->esp_transport_sock_errno, strerror(data->error_handle->esp_transport_sock_errno),
             data->error_handle->esp_tls_last_esp_err, data->error_handle->esp_tls_stack_err);
         } else if (data->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
-          str_value = malloc_stringf("connection refused, error: 0x%x", 
+          str_value = malloc_stringf("Connection refused, error: 0x%x", 
             data->error_handle->connect_return_code);
         } else {
-          str_value = malloc_stringf("unknown error type: 0x%x", 
+          str_value = malloc_stringf("Unknown error type: 0x%x", 
             data->error_handle->error_type);
         };
         // Repost event to main event loop
-        mqttErrorEventSend(str_value);
+        mqttErrorEventSend(str_value, nullptr);
         if (str_value) rlog_e(logTAG, "MQTT client error: %s", str_value);
       };
       #if CONFIG_SYSLED_MQTT_ACTIVITY
@@ -827,7 +848,7 @@ bool mqttClientDisconnect()
         eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_LOST, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
         rlog_i(logTAG, "Task [ MQTT_CLIENT ] was stopped");
       } else {
-        mqttErrorEventSendCode("Failed to stop task [ MQTT_CLIENT ]: %d %s", err);
+        mqttErrorEventSendCode("Failed to stop task [ MQTT_CLIENT ]: %d %s", nullptr, err);
         rlog_e(logTAG, "Failed to stop task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
       };
     } else {
@@ -855,7 +876,7 @@ bool mqttClientResume()
         eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR_CLEAR, nullptr, 0, portMAX_DELAY);
         rlog_i(logTAG, "Task [ MQTT_CLIENT ] was started");
       } else {
-        mqttErrorEventSendCode("Failed to start task [ MQTT_CLIENT ]: %d %s", err);
+        mqttErrorEventSendCode("Failed to start task [ MQTT_CLIENT ]: %d %s", nullptr, err);
         rlog_e(logTAG, "Failed to start task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
       };
     };
@@ -899,7 +920,7 @@ bool mqttClientStop()
 
 bool mqttTaskInit()
 {
-  return mqttBackToPrimaryTimerInit();
+  return mqttBackToPrimaryTimerInit(); // Not && !!!
 }
 
 bool mqttTaskStart(bool createSuspended)
