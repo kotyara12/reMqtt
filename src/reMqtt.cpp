@@ -438,14 +438,26 @@ esp_err_t mqttPublish(char *topic, char *payload, int qos, bool retained, bool f
       payload_len = strlen(payload);
     };
 
+    #if defined(CONFIG_MQTT_MAX_OUTBOX_SIZE) && (CONFIG_MQTT_MAX_OUTBOX_SIZE > 0)
+      bool _enqueueOutbox = esp_mqtt_client_get_outbox_size(_mqttClient) < CONFIG_MQTT_MAX_OUTBOX_SIZE;
+    #else
+      bool _enqueueOutbox = true;
+    #endif // CONFIG_MQTT_MAX_OUTBOX_SIZE
+
+    #if defined(CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE) && (CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE > 0)
+      bool _enqueueMessage = payload_len < CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE;
+    #else
+      bool _enqueueMessage = true;
+    #endif // CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE
+
     if (_mqttData.connected) {
-      if ((payload_len < CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE) && (esp_mqtt_client_get_outbox_size(_mqttClient) < CONFIG_MQTT_MAX_OUTBOX_SIZE)) {
+      if (_enqueueOutbox && _enqueueMessage) {
         esp_mqtt_client_enqueue(_mqttClient, topic, payload, payload_len, qos, retained, true) > -1 ? err = ESP_OK : err = ESP_FAIL;
       } else {
         esp_mqtt_client_publish(_mqttClient, topic, payload, payload_len, qos, retained) > -1 ? err = ESP_OK : err = ESP_FAIL;
       };
     } else {
-      if ((payload_len < CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE) && (esp_mqtt_client_get_outbox_size(_mqttClient) < CONFIG_MQTT_MAX_OUTBOX_SIZE)) {
+      if (_enqueueOutbox && _enqueueMessage) {
         esp_mqtt_client_enqueue(_mqttClient, topic, payload, payload_len, qos, retained, true) > -1 ? err = ESP_OK : err = ESP_FAIL;
       } else {
         err = ESP_ERR_INVALID_STATE;
@@ -488,7 +500,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
       _mqttData.conn_attempt++;
       rlog_i(logTAG, "Attempt # %d to connect to MQTT broker [ %s : %d ]...", _mqttData.conn_attempt, _mqttData.host, _mqttData.port);
       #if CONFIG_SYSLED_MQTT_ACTIVITY
-      ledSysActivity();
+        ledSysActivity();
       #endif // CONFIG_SYSLED_MQTT_ACTIVITY
     break;
 
@@ -899,7 +911,7 @@ bool mqttClientStop()
 
 bool mqttTaskInit()
 {
-  return mqttBackToPrimaryTimerInit();
+  return mqttBackToPrimaryTimerInit(); // Not && !!!
 }
 
 bool mqttTaskStart(bool createSuspended)
