@@ -42,10 +42,11 @@ void  mqttTopicStatusFree();
 #endif // CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
 
 bool mqttTaskStart(bool createSuspended);
-bool mqttTaskFree();
 bool mqttTaskRestart();
+bool mqttTaskFree();
 
 bool mqttEventHandlerRegister();
+void mqttEventHandlerUnregister();
 
 bool mqttIsConnected();
 int  mqttGetOutboxSize();

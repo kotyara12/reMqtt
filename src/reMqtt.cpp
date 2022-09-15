@@ -1,7 +1,9 @@
 #include "reMqtt.h"
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/task.h"
 #include <time.h>
+#include "reTgSend.h"
 
 static const char* logTAG = "MQTT";
 
@@ -28,16 +30,135 @@ static const char* logTAG = "MQTT";
   extern const uint8_t mqtt2_broker_pem_end[]   asm(CONFIG_MQTT2_TLS_PEM_END); 
 #endif // CONFIG_MQTT2_TLS_ENABLED
 
-typedef enum {
-  MQTT_CLIENT_STOPPED   = 0,
-  MQTT_CLIENT_STARTED   = 1,
-  MQTT_CLIENT_SUSPENDED = 2
-} mqtt_client_state_t;
-
-static re_mqtt_event_data_t _mqttData;
-static mqtt_client_state_t _mqttState = MQTT_CLIENT_STOPPED;
-static bool _mqttError = false;
 static esp_mqtt_client_handle_t _mqttClient = nullptr;
+static re_mqtt_event_data_t _mqttData;
+static uint32_t _mqttConnAttempt = 0;
+
+// -----------------------------------------------------------------------------------------------------------------------
+// ----------------------------------------------------- Status bits -----------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------
+
+static const uint32_t MQTTCLI_STARTED            = BIT0;
+static const uint32_t MQTTCLI_INET_AVAILABLED    = BIT1;
+static const uint32_t MQTTCLI_SERVER1_AVAILABLED = BIT2;
+static const uint32_t MQTTCLI_SERVER2_AVAILABLED = BIT3;
+static const uint32_t MQTTCLI_SERVER2_ACTIVE     = BIT4;
+static const uint32_t MQTTCLI_CONNECTED          = BIT5;
+static const uint32_t MQTTCLI_ERROR              = BIT6;
+
+static EventGroupHandle_t _mqttStates = nullptr;
+#if CONFIG_MQTT_STATIC_ALLOCATION
+  StaticEventGroup_t _mqttBufStates;
+#endif // CONFIG_MQTT_STATIC_ALLOCATION
+
+bool mqttStatesInit() 
+{
+  if (_mqttStates == nullptr) {
+    #if CONFIG_MQTT_STATIC_ALLOCATION
+      _mqttStates = xEventGroupCreateStatic(&_mqttBufStates);
+    #else
+      _mqttStates = xEventGroupCreate();
+    #endif // CONFIG_MQTT_STATIC_ALLOCATION
+    if (_mqttStates != nullptr) {
+      xEventGroupClearBits(_mqttStates, 0x00FFFFFFU);
+      xEventGroupSetBits(_mqttStates, MQTTCLI_INET_AVAILABLED | MQTTCLI_SERVER1_AVAILABLED | MQTTCLI_SERVER2_AVAILABLED);
+    } else {
+      rlog_e(logTAG, "Failed to create event group!");
+    };
+  };
+  return _mqttStates != nullptr;
+}
+
+void mqttStatesFree() 
+{
+  if (_mqttStates) {
+    vEventGroupDelete(_mqttStates);
+    _mqttStates = nullptr;
+  };
+}
+
+EventBits_t mqttStatesGet() 
+{
+  if (_mqttStates) {
+    return xEventGroupGetBits(_mqttStates);
+  };
+  rlog_e(logTAG, "Failed to get status bits, event group is null!");
+  return 0;
+}
+
+bool mqttStatesCheck(EventBits_t bits, const bool clearOnExit) 
+{
+  if (_mqttStates) {
+    if (clearOnExit) {
+      return (xEventGroupClearBits(_mqttStates, bits) & bits) == bits;
+    } else {
+      return (xEventGroupGetBits(_mqttStates) & bits) == bits;
+    };
+  };
+  rlog_e(logTAG, "Failed to check status bits: %X, event group is null!", bits);
+  return false;
+}
+
+bool mqttStatesClear(EventBits_t bits)
+{
+  if (!_mqttStates) {
+    rlog_e(logTAG, "Failed to set status bits: %X, event group is null!", bits);
+    return false;
+  };
+  EventBits_t prevClear = xEventGroupClearBits(_mqttStates, bits);
+  if ((prevClear & bits) != 0) {
+    EventBits_t afterClear = xEventGroupGetBits(_mqttStates);
+    if ((afterClear & bits) != 0) {
+      rlog_e(logTAG, "Failed to clear status bits: %X, current value: %X", bits, afterClear);
+      return false;
+    };
+  };
+  return true;
+}
+
+bool mqttStatesSet(EventBits_t bits)
+{
+  if (!_mqttStates) {
+    rlog_e(logTAG, "Failed to set status bits: %X, event group is null!", bits);
+    return false;
+  };
+  EventBits_t afterSet = xEventGroupSetBits(_mqttStates, bits);
+  if ((afterSet & bits) != bits) {
+    rlog_e(logTAG, "Failed to set status bits: %X, current value: %X", bits, afterSet);
+    return false;
+  };
+  return true;
+}
+
+bool mqttStatesSetBit(EventBits_t bit, bool state)
+{
+  if (state) {
+    return mqttStatesSet(bit);
+  } else {
+    return mqttStatesClear(bit);
+  };
+}
+
+EventBits_t mqttStatesWait(EventBits_t bits, BaseType_t clearOnExit, BaseType_t waitAllBits, TickType_t timeout)
+{
+  if (_mqttStates) {
+    return xEventGroupWaitBits(_mqttStates, bits, clearOnExit, waitAllBits, timeout) & bits; 
+  };  
+  return 0;
+}
+
+EventBits_t mqttStatesWaitMs(EventBits_t bits, BaseType_t clearOnExit, BaseType_t waitAllBits, TickType_t timeout)
+{
+  if (_mqttStates) {
+    if (timeout == 0) {
+      return xEventGroupWaitBits(_mqttStates, bits, clearOnExit, waitAllBits, portMAX_DELAY) & bits; 
+    }
+    else {
+      return xEventGroupWaitBits(_mqttStates, bits, clearOnExit, waitAllBits, pdMS_TO_TICKS(timeout)) & bits; 
+    };
+  };  
+  return 0;
+}
 
 // -----------------------------------------------------------------------------------------------------------------------
 // --------------------------------------------- Return to main server timer ---------------------------------------------
@@ -121,12 +242,12 @@ bool mqttBackToPrimaryTimerStop()
 #endif // CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES
 
 // -----------------------------------------------------------------------------------------------------------------------
-// ----------------------------------------------------- Utilites --------------------------------------------------------
+// ----------------------------------------------------- Routines --------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
 
 bool mqttIsConnected() 
 {
-  return wifiIsConnected() && _mqttData.connected;
+  return wifiIsConnected() && (_mqttClient) && mqttStatesCheck(MQTTCLI_STARTED | MQTTCLI_CONNECTED, false);
 }
 
 int mqttGetOutboxSize()
@@ -136,7 +257,7 @@ int mqttGetOutboxSize()
 
 void mqttErrorEventSend(const char* message, const char* object)
 {
-  _mqttError = true;
+  mqttStatesSet(MQTTCLI_ERROR);
   if (message) {
     if (object) {
       char* err_msg = malloc_stringf(message, object);
@@ -154,22 +275,24 @@ void mqttErrorEventSend(const char* message, const char* object)
 
 void mqttErrorEventSendCode(const char* message, const char* object, esp_err_t error_code)
 {
-  char* err_msg = nullptr;
-  if (object) {
-    err_msg = malloc_stringf(message, object, error_code, esp_err_to_name(error_code));
-  } else {
-    err_msg = malloc_stringf(message, error_code, esp_err_to_name(error_code));
-  };
-  if (err_msg) {
-    eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR, (void*)err_msg, strlen(err_msg)+1, portMAX_DELAY);
-    free(err_msg);
+  mqttStatesSet(MQTTCLI_ERROR);
+  if (message) {
+    char* err_msg = nullptr;
+    if (object) {
+      err_msg = malloc_stringf(message, object, error_code, esp_err_to_name(error_code));
+    } else {
+      err_msg = malloc_stringf(message, error_code, esp_err_to_name(error_code));
+    };
+    if (err_msg) {
+      eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR, (void*)err_msg, strlen(err_msg)+1, portMAX_DELAY);
+      free(err_msg);
+    };
   };
 }
 
 void mqttErrorEventClear()
 {
-  if (_mqttError) {
-    _mqttError = false;
+  if (mqttStatesCheck(MQTTCLI_ERROR, true)) {
     eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR_CLEAR, nullptr, 0, portMAX_DELAY);
   };
 }
@@ -180,7 +303,7 @@ void mqttErrorEventClear()
 
 #if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE || CONFIG_MQTT_STATUS_ONLINE_SYSINFO
 
-static char* _mqttTopicStatus = NULL;
+static char* _mqttTopicStatus = nullptr;
 
 char* mqttTopicStatusCreate(const bool primary)
 {
@@ -197,7 +320,7 @@ char* mqttTopicStatusCreate(const bool primary)
 char* mqttTopicStatusGet()
 {
   if (!_mqttTopicStatus) {
-    if (_mqttData.connected) {
+    if (mqttStatesCheck(MQTTCLI_CONNECTED, false)) {
       mqttTopicStatusCreate(_mqttData.primary);
     };
   };
@@ -218,13 +341,10 @@ void mqttTopicStatusFree()
 // -----------------------------------------------------------------------------------------------------------------------
 
 // Connect to server with new parameters
-bool mqttClientStart();
-bool mqttClientDisconnect();
-bool mqttClientResume();
-bool mqttClientStop();
-
-static bool _mqttInternetAvailable = false;
-static bool _mqttServer1Available = true;
+esp_err_t mqttClientInitAndStart();
+esp_err_t mqttClientStart();
+esp_err_t mqttClientStop();
+esp_err_t mqttClientDestroy();
 
 bool mqttServer1isLocal()
 {
@@ -233,14 +353,10 @@ bool mqttServer1isLocal()
 
 bool mqttServer1Enabled()
 {
-  // rlog_d(logTAG, "mqttServer1Enabled(): _mqttServer1Available=%d, _mqttInternetAvailable=%d", _mqttServer1Available, _mqttInternetAvailable);
-  return _mqttServer1Available && (_mqttInternetAvailable || mqttServer1isLocal());
+  return mqttStatesCheck(MQTTCLI_SERVER1_AVAILABLED, false) && (mqttServer1isLocal() || mqttStatesCheck(MQTTCLI_INET_AVAILABLED, false));
 }
 
 #ifdef CONFIG_MQTT2_TYPE
-
-static bool _mqttPrimary = true;
-static bool _mqttServer2Available = true;
 
 bool mqttServer2isLocal()
 {
@@ -249,95 +365,66 @@ bool mqttServer2isLocal()
 
 bool mqttServer2Enabled()
 {
-  return _mqttServer2Available && (_mqttInternetAvailable || mqttServer2isLocal());
+  return mqttStatesCheck(MQTTCLI_SERVER2_AVAILABLED, false) && (mqttServer2isLocal() || mqttStatesCheck(MQTTCLI_INET_AVAILABLED, false));
 }
 
-bool mqttServer1Start()
+bool mqttServer1Activate()
 {
-  _mqttPrimary = true;
-  rlog_i(logTAG, "Primary MQTT broker selected");
-  mqttBackToPrimaryTimerStop();
-  return mqttClientStart();
-}
-
-bool mqttServer2Start()
-{
-  _mqttPrimary = false;
-  rlog_i(logTAG, "Reserved MQTT broker selected");
-  mqttBackToPrimaryTimerStart();
-  return mqttClientStart();
-}
-
-bool mqttServer1Select()
-{
-  _mqttPrimary = true;
-  rlog_w(logTAG, "Switching to primary MQTT broker");
-  mqttBackToPrimaryTimerStop();
-  return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SERVER_PRIMARY, nullptr, 0, portMAX_DELAY);
-}
-
-bool mqttServer2Select()
-{
-  _mqttPrimary = false;
-  rlog_w(logTAG, "Switching to reserved MQTT broker");
-  mqttBackToPrimaryTimerStart();
-  return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, nullptr, 0, portMAX_DELAY);
-}
-
-bool mqttServer1Acivate()
-{
-  switch (_mqttState) {
-    case MQTT_CLIENT_STOPPED:
-      return mqttServer1Start();
-      break;
-    case MQTT_CLIENT_STARTED:
-      if (!_mqttPrimary) {
-        return mqttServer1Select();
-      };
-      break;
-    case MQTT_CLIENT_SUSPENDED:
-      if (_mqttPrimary) {
-        return mqttClientResume();
+  if (mqttStatesCheck(MQTTCLI_SERVER2_ACTIVE, false) || (_mqttClient == nullptr) || !mqttStatesCheck(MQTTCLI_STARTED, false)) {
+    rlog_i(logTAG, "Primary MQTT broker selected");
+    mqttBackToPrimaryTimerStop();
+    mqttStatesClear(MQTTCLI_SERVER2_ACTIVE);
+    if (_mqttClient) {
+      if (mqttStatesCheck(MQTTCLI_STARTED, false)) {
+        // The client is already running - can only be restarted through the event loop (from another task)
+        return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SERVER_PRIMARY, nullptr, 0, portMAX_DELAY);
       } else {
-        return mqttServer1Select();
+        // The client is not running yet - you can just run it from this task
+        return mqttClientStart() == ESP_OK;
       };
-      break;
+    } else {
+      // The client is not initialized
+      return mqttClientInitAndStart() == ESP_OK;
+    };
   };
-  return false;
+  return true;
 }
 
-bool mqttServer2Acivate()
+bool mqttServer2Activate()
 {
-  switch (_mqttState) {
-    case MQTT_CLIENT_STOPPED:
-      return mqttServer2Start();
-      break;
-    case MQTT_CLIENT_STARTED:
-      if (_mqttPrimary) {
-        return mqttServer2Select();
-      };
-      break;
-    case MQTT_CLIENT_SUSPENDED:
-      if (!_mqttPrimary) {
-        return mqttClientResume();
+  if (!mqttStatesCheck(MQTTCLI_SERVER2_ACTIVE, false) || (_mqttClient == nullptr) || !mqttStatesCheck(MQTTCLI_STARTED, false)) {
+    rlog_i(logTAG, "Reserved MQTT broker selected");
+    mqttBackToPrimaryTimerStart();
+    mqttStatesSet(MQTTCLI_SERVER2_ACTIVE);
+    if (_mqttClient) {
+      // The client is not initialized
+      return mqttClientInitAndStart() == ESP_OK;
+    } else {
+      if (mqttStatesCheck(MQTTCLI_STARTED, false)) {
+        // The client is already running - can only be restarted through the event loop (from another task)
+        return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, nullptr, 0, portMAX_DELAY);
       } else {
-        return mqttServer2Select();
+        // The client is not running yet - you can just run it from this task
+        return mqttClientStart() == ESP_OK;
       };
-      break;
+    };
   };
-  return false;
+  return true;
 }
 
 // Setting network availability and starting the client, depending on which server is currently available
 bool mqttServerSelectAuto()
 {
   if (mqttServer1Enabled()) {
-    return mqttServer1Acivate();
+    return mqttServer1Activate();
   } else {
     if (mqttServer2Enabled()) {
-      return mqttServer2Acivate();
+      return mqttServer2Activate();
     } else {
-      return mqttClientDisconnect();
+      if (mqttStatesCheck(MQTTCLI_STARTED, false)) {
+        // Send event to suspend service
+        return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SELF_STOP, nullptr, 0, portMAX_DELAY);
+      };
     };
   };
   return false;
@@ -346,8 +433,8 @@ bool mqttServerSelectAuto()
 // Server status change (by ping)
 bool mqttServer2SetAvailable(bool newAvailable)
 {
-  if (_mqttServer2Available != newAvailable) {
-    _mqttServer2Available = newAvailable;
+  if (mqttStatesCheck(MQTTCLI_SERVER2_AVAILABLED, false) != newAvailable) {
+    mqttStatesSetBit(MQTTCLI_SERVER2_AVAILABLED, newAvailable);
     return mqttServerSelectAuto();
   };
   return false;
@@ -358,18 +445,22 @@ bool mqttServer2SetAvailable(bool newAvailable)
 bool mqttServerSelectAuto()
 {
   if (mqttServer1Enabled()) {
-    switch (_mqttState) {
-      case MQTT_CLIENT_STOPPED:
-        return mqttClientStart();
-      case MQTT_CLIENT_STARTED:
-        return false;
-      case MQTT_CLIENT_SUSPENDED:
-        return mqttClientResume();
+    mqttStatesClear(MQTTCLI_SERVER2_ACTIVE);
+    if (_mqttClient) {
+      if (mqttStatesCheck(MQTTCLI_STARTED, false)) {
+        // The client is already running
+        return true;
+      } else {
+        // The client is not running yet - you can just run it from this task
+        return mqttClientStart() == ESP_OK;
+      };
+    } else {
+      // The client is not initialized
+      return mqttClientInitAndStart() == ESP_OK;
     };
   } else {
-    if (_mqttState == MQTT_CLIENT_STARTED) {
-      return mqttClientDisconnect();
-    };
+    // Send event to suspend service
+    return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SELF_STOP, nullptr, 0, portMAX_DELAY);
   };
   return false;
 }
@@ -379,23 +470,17 @@ bool mqttServerSelectAuto()
 // Server status change (by ping)
 bool mqttServer1SetAvailable(bool newAvailable)
 {
-  if (_mqttServer1Available != newAvailable) {
-    _mqttServer1Available = newAvailable;
+  if (mqttStatesCheck(MQTTCLI_SERVER1_AVAILABLED, false) != newAvailable) {
+    mqttStatesSetBit(MQTTCLI_SERVER1_AVAILABLED, newAvailable);
     return mqttServerSelectAuto();
   };
   return false;
 }
 
 // Server status change (by internet)
-bool mqttServerSelectInet(bool internetAvailable, bool updateServers)
+bool mqttServerSetInetAvailable(bool internetAvailable)
 {
-  _mqttInternetAvailable = internetAvailable;
-  if (updateServers) {
-    _mqttServer1Available = internetAvailable || mqttServer1isLocal();
-    #ifdef CONFIG_MQTT2_TYPE
-    _mqttServer2Available = internetAvailable || mqttServer2isLocal();
-    #endif // CONFIG_MQTT2_TYPE
-  };
+  mqttStatesSetBit(MQTTCLI_INET_AVAILABLED, internetAvailable);
   return mqttServerSelectAuto();
 }
 
@@ -405,7 +490,7 @@ bool mqttServerSelectInet(bool internetAvailable, bool updateServers)
 
 bool mqttSubscribe(const char *topic, int qos)
 {
-  if (_mqttData.connected && (topic != nullptr)) {
+  if (mqttStatesCheck(MQTTCLI_CONNECTED, false) && (topic != nullptr)) {
     if (esp_mqtt_client_subscribe(_mqttClient, topic, qos) == -1) {
       rlog_e(logTAG, "Failed to subscribe to topic \"%s\"", topic);
       mqttErrorEventSend("Failed to subscribe to topic \"%s\"", topic);
@@ -419,7 +504,7 @@ bool mqttSubscribe(const char *topic, int qos)
 
 bool mqttUnsubscribe(const char *topic)
 {
-  if (_mqttData.connected && (topic != nullptr)) {
+  if (mqttStatesCheck(MQTTCLI_CONNECTED, false) && (topic != nullptr)) {
     if (esp_mqtt_client_unsubscribe(_mqttClient, topic) == -1) {
       rlog_e(logTAG, "Failed to unsubscribe from topic \"%s\"", topic);
       mqttErrorEventSend("Failed to unsubscribe from topic \"%s\"", topic);
@@ -459,7 +544,7 @@ esp_err_t mqttPublish(char *topic, char *payload, int qos, bool retained, bool f
       bool _enqueueMessage = true;
     #endif // CONFIG_MQTT_MAX_OUTBOX_MESSAGE_SIZE
 
-    if (_mqttData.connected) {
+    if (mqttStatesCheck(MQTTCLI_CONNECTED, false)) {
       if (_enqueueOutbox && _enqueueMessage) {
         esp_mqtt_client_enqueue(_mqttClient, topic, payload, payload_len, qos, retained, true) > -1 ? err = ESP_OK : err = ESP_FAIL;
       } else {
@@ -506,16 +591,17 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
 
   switch (data->event_id) {
     case MQTT_EVENT_BEFORE_CONNECT:
-      _mqttData.conn_attempt++;
-      rlog_i(logTAG, "Attempt # %d to connect to MQTT broker [ %s : %d ]...", _mqttData.conn_attempt, _mqttData.host, _mqttData.port);
+      _mqttConnAttempt++;
+      mqttStatesClear(MQTTCLI_CONNECTED);
+      rlog_i(logTAG, "Attempt # %d to connect to MQTT broker [ %s : %d ]...", _mqttConnAttempt, _mqttData.host, _mqttData.port);
       #if CONFIG_SYSLED_MQTT_ACTIVITY
         ledSysActivity();
       #endif // CONFIG_SYSLED_MQTT_ACTIVITY
     break;
 
     case MQTT_EVENT_CONNECTED:
-      _mqttData.connected = true;
-      _mqttData.conn_attempt = 0;
+      _mqttConnAttempt = 0;
+      mqttStatesSet(MQTTCLI_CONNECTED);
       rlog_i(logTAG, "Connection to MQTT broker [ %s : %d ] established", _mqttData.host, _mqttData.port);
       // Repost event to main event loop
       eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONNECTED, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
@@ -529,24 +615,24 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
 
     case MQTT_EVENT_DISCONNECTED:
       mqttErrorEventSend(nullptr, nullptr);
-      if (_mqttData.connected) {
+      if (mqttStatesCheck(MQTTCLI_CONNECTED, false)) {
         // The connection has already been established before, the connection is lost
-        _mqttData.connected = false;
+        mqttStatesClear(MQTTCLI_CONNECTED);
         rlog_w(logTAG, "Lost connection to MQTT broker [ %s : %d ]", _mqttData.host, _mqttData.port);
         // Repost event to main event loop
         eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_LOST, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
       } else {
         // Failed to establish connection
-        if (_mqttData.conn_attempt == CONFIG_MQTT_CONNECT_ATTEMPTS) {
+        if (_mqttConnAttempt == CONFIG_MQTT_CONNECT_ATTEMPTS) {
           // Repost event to main event loop
           eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_FAILED, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
           #ifdef CONFIG_MQTT2_TYPE
-          // Switching to the another server - disable current server
-          if (_mqttPrimary) {
-            mqttServer1SetAvailable(false);
-          } else {
-            mqttServer2SetAvailable(false);
-          };
+            // Switching to the another server - disable current server
+            if (mqttStatesCheck(MQTTCLI_SERVER2_ACTIVE, false)) {
+              mqttServer1SetAvailable(false);
+            } else {
+              mqttServer2SetAvailable(false);
+            };
           #endif // CONFIG_MQTT2_TYPE
         };
       };
@@ -557,7 +643,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
     case MQTT_EVENT_PUBLISHED:
       mqttErrorEventClear();
       #if CONFIG_SYSLED_MQTT_ACTIVITY
-      ledSysActivity();
+        ledSysActivity();
       #endif // CONFIG_SYSLED_MQTT_ACTIVITY
       break;
     
@@ -580,7 +666,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
               // Repost string to main event loop
               eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_INCOMING_DATA, &in_buffer, sizeof(in_buffer), portMAX_DELAY);
               #if CONFIG_SYSLED_MQTT_ACTIVITY
-              ledSysActivity();
+                ledSysActivity();
               #endif // CONFIG_SYSLED_MQTT_ACTIVITY
             };
           };
@@ -607,7 +693,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
         if (str_value) rlog_e(logTAG, "MQTT client error: %s", str_value);
       };
       #if CONFIG_SYSLED_MQTT_ACTIVITY
-      ledSysActivity();
+        ledSysActivity();
       #endif // CONFIG_SYSLED_MQTT_ACTIVITY
       break;
 
@@ -793,134 +879,128 @@ void mqttSetConfigReserved(esp_mqtt_client_config_t * mqttCfg)
 #endif // CONFIG_MQTT2_TYPE
 
 // -----------------------------------------------------------------------------------------------------------------------
-// --------------------------------------------------- Task routines -----------------------------------------------------
+// --------------------------------------------------- Client routines ---------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
 
-bool mqttClientStart() 
+esp_err_t mqttClientStop()
 {
-  // Disconnect from broker and stop task if it is currently running
-  mqttClientStop();
-
-  // Reset variables
-  _mqttState = MQTT_CLIENT_STOPPED;
-  memset(&_mqttData, 0, sizeof(_mqttData));
-
-  // Configuring broker parameters
-  static esp_mqtt_client_config_t _mqttCfg;
-  #ifdef CONFIG_MQTT2_TYPE
-    if (_mqttPrimary) {
-      mqttSetConfigPrimary(&_mqttCfg);
-    } else {
-      mqttSetConfigReserved(&_mqttCfg);
-    };
-  #else
-    mqttSetConfigPrimary(&_mqttCfg);
-  #endif // CONFIG_MQTT2_TYPE
-
-  RE_MEM_CHECK_EVENT(_mqttCfg.host, return false);
-  #if CONFIG_MQTT_STATUS_LWT
-    RE_MEM_CHECK_EVENT(_mqttCfg.lwt_topic, return false);
-  #endif // CONFIG_MQTT_STATUS_LWT
-    
-  // Launching the client
-  _mqttClient = esp_mqtt_client_init(&_mqttCfg);
-  RE_MEM_CHECK_EVENT(_mqttClient, return false);
-  RE_OK_CHECK_EVENT(esp_mqtt_client_register_event(_mqttClient, MQTT_EVENT_ANY, mqttEventHandler, _mqttClient), return false);
-  RE_OK_CHECK_EVENT(esp_mqtt_client_start(_mqttClient), return false);
-  
-  _mqttState = MQTT_CLIENT_STARTED;
-  rlog_i(logTAG, "Task [ MQTT_CLIENT ] was created");
-  return true;
-}
-
-bool mqttClientDisconnect()
-{
-  bool ret = false;
-
   if (_mqttClient) {
-    if (_mqttState == MQTT_CLIENT_STARTED) {
-      // Stop mqtt client
+    if (mqttStatesCheck(MQTTCLI_STARTED, false)) {
       esp_err_t err = esp_mqtt_client_stop(_mqttClient);
-      ret = err == ESP_OK;
-      if (ret) {
-        _mqttData.connected = false;
-        _mqttState = MQTT_CLIENT_SUSPENDED;
-        eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_LOST, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
+      if (err == ESP_OK) {
+        if (mqttStatesCheck(MQTTCLI_CONNECTED, false)) {
+          eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_LOST, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
+        };
+        mqttStatesClear(MQTTCLI_STARTED | MQTTCLI_CONNECTED);
         rlog_i(logTAG, "Task [ MQTT_CLIENT ] was stopped");
       } else {
         mqttErrorEventSendCode("Failed to stop task [ MQTT_CLIENT ]: %d %s", nullptr, err);
         rlog_e(logTAG, "Failed to stop task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
       };
-    } else {
-      ret = true;
-      rlog_i(logTAG, "Task [ MQTT_CLIENT ] already stopped");
+      return err;
     };
+    return ESP_OK;
   };
-
-  return ret;
+  return ESP_FAIL;
 }
 
-bool mqttClientResume()
+esp_err_t mqttClientDestroy()
 {
-  bool ret = false;
-
   if (_mqttClient) {
-    if (_mqttState == MQTT_CLIENT_STARTED) {
-      ret = true;
-      rlog_w(logTAG, "Task [ MQTT_CLIENT ] already started");
-    } else {
+    // Disсonnect from server and stop task
+    esp_err_t err = mqttClientStop();
+    if (err == ESP_OK) {
+      err = esp_mqtt_client_destroy(_mqttClient);
+      if (err == ESP_OK) {
+        _mqttClient = nullptr;
+        _mqttConnAttempt = 0;
+        mqttStatesClear(MQTTCLI_STARTED | MQTTCLI_CONNECTED);
+        #if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
+          mqttTopicStatusFree();
+        #endif // CONFIG_MQTT_STATUS_LWT
+        rlog_d(logTAG, "Task [ MQTT_CLIENT ] was deleted");
+      } else {
+        rlog_e(logTAG, "Failed to destroy task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
+      };
+    };
+    return err;
+  };
+  return ESP_OK;
+}
+
+esp_err_t mqttClientInitAndStart() 
+{
+  // Disconnect the current connection if it exists
+  mqttClientDestroy();
+
+  // Reset variables
+  _mqttConnAttempt = 0;
+  memset(&_mqttData, 0, sizeof(_mqttData));
+  mqttStatesClear(MQTTCLI_STARTED | MQTTCLI_CONNECTED);
+
+  // Configuring broker parameters
+  static esp_mqtt_client_config_t _mqttCfg;
+  #ifdef CONFIG_MQTT2_TYPE
+    mqttStatesCheck(MQTTCLI_SERVER2_ACTIVE, false) ? mqttSetConfigReserved(&_mqttCfg) : mqttSetConfigPrimary(&_mqttCfg);
+  #else
+    mqttSetConfigPrimary(&_mqttCfg);
+  #endif // CONFIG_MQTT2_TYPE
+
+  RE_MEM_CHECK_EVENT(_mqttCfg.host, return ESP_ERR_INVALID_ARG);
+  #if CONFIG_MQTT_STATUS_LWT
+    RE_MEM_CHECK_EVENT(_mqttCfg.lwt_topic, return ESP_ERR_INVALID_ARG);
+  #endif // CONFIG_MQTT_STATUS_LWT
+    
+  // Launching the client
+  _mqttClient = esp_mqtt_client_init(&_mqttCfg);
+  if (_mqttClient == nullptr) {
+    rlog_e(logTAG, "Failed to create task [ MQTT_CLIENT ]: out of memory");
+    mqttErrorEventSendCode("Failed to create task [ MQTT_CLIENT ]: %d %s", nullptr, ESP_ERR_NO_MEM);
+    return ESP_ERR_NO_MEM;
+  };
+  esp_err_t err = esp_mqtt_client_register_event(_mqttClient, MQTT_EVENT_ANY, mqttEventHandler, _mqttClient);
+  if (err != ESP_OK) {
+    mqttErrorEventSendCode("Failed to start task [ MQTT_CLIENT ]: %d %s", nullptr, err);
+    rlog_e(logTAG, "Failed to start task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
+  };
+  err = esp_mqtt_client_start(_mqttClient);
+  if (err != ESP_OK) {
+    mqttErrorEventSendCode("Failed to start task [ MQTT_CLIENT ]: %d %s", nullptr, err);
+    rlog_e(logTAG, "Failed to start task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
+  };
+  mqttStatesSet(MQTTCLI_STARTED);
+  rlog_i(logTAG, "Task [ MQTT_CLIENT ] was created");
+  return ESP_OK;
+}
+
+esp_err_t mqttClientStart()
+{
+  if (_mqttClient) {
+    if (!mqttStatesCheck(MQTTCLI_STARTED, false)) {
+      mqttStatesClear(MQTTCLI_CONNECTED);
       esp_err_t err = esp_mqtt_client_start(_mqttClient);
-      ret = err == ESP_OK;
-      if (ret) {
-        _mqttState = MQTT_CLIENT_STARTED;
-        eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_ERROR_CLEAR, nullptr, 0, portMAX_DELAY);
+      if (err == ESP_OK) {
+        mqttStatesSet(MQTTCLI_STARTED);
         rlog_i(logTAG, "Task [ MQTT_CLIENT ] was started");
       } else {
         mqttErrorEventSendCode("Failed to start task [ MQTT_CLIENT ]: %d %s", nullptr, err);
         rlog_e(logTAG, "Failed to start task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
       };
+      return err;
     };
+    return ESP_OK;
   } else {
-    ret = mqttClientStart();
+    return mqttClientInitAndStart();
   };
-
-  return ret;
 }
 
-bool mqttClientStop()
-{
-  bool ret = true;
-
-  // Disсonnect from server and stop task
-  if (_mqttState == MQTT_CLIENT_STARTED) {
-    ret = mqttClientDisconnect();
-  };
-
-  if (ret) {
-    if (_mqttClient) {
-      esp_err_t err = esp_mqtt_client_destroy(_mqttClient);
-      if (err != ESP_OK) {
-        rlog_e(logTAG, "Failed to destroy task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
-      };
-
-      _mqttClient = nullptr;
-      _mqttState = MQTT_CLIENT_STOPPED;
-      _mqttData.connected = false;
-      _mqttData.conn_attempt = 0;
-      eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_LOST, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
-      #if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
-      mqttTopicStatusFree();
-      #endif // CONFIG_MQTT_STATUS_LWT
-      rlog_d(logTAG, "Task [ MQTT_CLIENT ] was deleted");
-    };
-    
-  };
-  return ret;
-}
+// -----------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------- Task routines ----------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------
 
 bool mqttTaskInit()
 {
-  return mqttBackToPrimaryTimerInit(); // Not && !!!
+  return mqttStatesInit() && mqttBackToPrimaryTimerInit();
 }
 
 bool mqttTaskStart(bool createSuspended)
@@ -928,18 +1008,24 @@ bool mqttTaskStart(bool createSuspended)
   if (createSuspended) {
     return mqttTaskInit() && mqttEventHandlerRegister();
   } else {
-    return mqttTaskInit() && mqttServerSelectAuto();
+    return mqttTaskInit() && mqttEventHandlerRegister() && mqttServerSelectAuto();
   };
-}
-
-bool mqttTaskFree()
-{
-  return mqttClientStop() && mqttBackToPrimaryTimerFree();
 }
 
 bool mqttTaskRestart()
 {
   return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_RESTART, nullptr, 0, portMAX_DELAY);
+}
+
+bool mqttTaskFree()
+{
+  if (mqttClientDestroy()) {
+    mqttEventHandlerUnregister();
+    mqttBackToPrimaryTimerFree();
+    mqttStatesFree();
+    return true;
+  };
+  return false;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------
@@ -950,33 +1036,39 @@ static void mqttWiFiEventHandler(void* arg, esp_event_base_t event_base, int32_t
 {
   // STA connected, Internet access not checked
   if (event_id == RE_WIFI_STA_GOT_IP) {
-    rlog_v(logTAG, "Event received: RE_WIFI_STA_GOT_IP");
-    mqttServerSelectInet(false, true);
+    // rlog_v(logTAG, "Event received: RE_WIFI_STA_GOT_IP");
+    mqttServerSetInetAvailable(false);
   }
   // STA connected and Internet access is available
   else if (event_id == RE_WIFI_STA_PING_OK) {
-    rlog_v(logTAG, "Event received: RE_WIFI_STA_PING_OK");
-    mqttServerSelectInet(true, true);
+    // rlog_v(logTAG, "Event received: RE_WIFI_STA_PING_OK");
+    mqttServerSetInetAvailable(true);
   }
   // Internet access lost
   else if (event_id == RE_WIFI_STA_PING_FAILED) {
-    rlog_v(logTAG, "Event received: RE_WIFI_STA_PING_FAILED");
-    mqttServerSelectInet(false, true);
+    // rlog_v(logTAG, "Event received: RE_WIFI_STA_PING_FAILED");
+    mqttServerSetInetAvailable(false);
   }
   // STA disconnected
   else if ((event_id == RE_WIFI_STA_DISCONNECTED) || (event_id == RE_WIFI_STA_STOPPED)) {
-    rlog_v(logTAG, "Event received: RE_WIFI_STA_DISCONNECTED");
-    if (_mqttState == MQTT_CLIENT_STARTED) {
-      mqttClientDisconnect();
+    // rlog_v(logTAG, "Event received: RE_WIFI_STA_DISCONNECTED");
+    if (mqttStatesCheck(MQTTCLI_STARTED, false)) {
+      mqttClientStop();
     };
   };
 }
 
 static void mqttSelfEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
-  if ((event_id == RE_MQTT_RESTART) || (event_id == RE_MQTT_SERVER_PRIMARY) || (event_id == RE_MQTT_SERVER_RESERVED)) {
+  if (event_id == RE_MQTT_SELF_STOP) {
     mqttClientStop();
-    vTaskDelay(pdMS_TO_TICKS(1000));
+  } else if ((event_id == RE_MQTT_RESTART) || (event_id == RE_MQTT_SERVER_PRIMARY) || (event_id == RE_MQTT_SERVER_RESERVED)) {
+    uint8_t cntTry = 0;
+    while ((_mqttClient) && (cntTry < 60)) {
+      cntTry++;
+      mqttClientDestroy();
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    };
     mqttClientStart();
   };
 }
@@ -1031,8 +1123,26 @@ bool mqttEventHandlerRegister()
       && eventHandlerRegister(RE_PING_EVENTS, RE_PING_MQTT2_AVAILABLE, &mqttPing2EventHandler, nullptr)
       && eventHandlerRegister(RE_PING_EVENTS, RE_PING_MQTT2_UNAVAILABLE, &mqttPing2EventHandler, nullptr)
       #endif // CONFIG_MQTT2_PING_CHECK
+      && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_RESTART, &mqttSelfEventHandler, nullptr)
+      && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_SELF_STOP, &mqttSelfEventHandler, nullptr)
       && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_SERVER_PRIMARY, &mqttSelfEventHandler, nullptr)
-      && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, &mqttSelfEventHandler, nullptr)
-      && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_RESTART, &mqttSelfEventHandler, nullptr);
+      && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, &mqttSelfEventHandler, nullptr);
 }
 
+void mqttEventHandlerUnregister()
+{
+  rlog_d(logTAG, "Unregister MQTT event handlers...");
+  eventHandlerUnregister(RE_WIFI_EVENTS, ESP_EVENT_ANY_ID, &mqttWiFiEventHandler);
+  #if defined(CONFIG_MQTT1_PING_CHECK) && CONFIG_MQTT1_PING_CHECK
+    eventHandlerUnregister(RE_PING_EVENTS, RE_PING_MQTT1_AVAILABLE, &mqttPing1EventHandler);
+    eventHandlerUnregister(RE_PING_EVENTS, RE_PING_MQTT1_UNAVAILABLE, &mqttPing1EventHandler);
+  #endif // CONFIG_MQTT1_PING_CHECK
+  #if defined(CONFIG_MQTT2_TYPE) && defined(CONFIG_MQTT2_PING_CHECK) && CONFIG_MQTT2_PING_CHECK
+    eventHandlerUnregister(RE_PING_EVENTS, RE_PING_MQTT2_AVAILABLE, &mqttPing2EventHandler);
+    eventHandlerUnregister(RE_PING_EVENTS, RE_PING_MQTT2_UNAVAILABLE, &mqttPing2EventHandler);
+  #endif // CONFIG_MQTT2_PING_CHECK
+  eventHandlerUnregister(RE_MQTT_EVENTS, RE_MQTT_RESTART, &mqttSelfEventHandler);
+  eventHandlerUnregister(RE_MQTT_EVENTS, RE_MQTT_SELF_STOP, &mqttSelfEventHandler);
+  eventHandlerUnregister(RE_MQTT_EVENTS, RE_MQTT_SERVER_PRIMARY, &mqttSelfEventHandler);
+  eventHandlerUnregister(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, &mqttSelfEventHandler);
+}
