@@ -678,7 +678,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
       if (event_data) {
         // Generate error message
         if (data->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-          str_value = malloc_stringf("Transport error: %d (%s)\nESP_TLS error code: 0x%x\nTLS stack error: 0x%x", 
+          str_value = malloc_stringf("Transport error: %d\n  - %s\nESP_TLS error:   0x%X\nTLS stack error: 0x%X", 
             data->error_handle->esp_transport_sock_errno, strerror(data->error_handle->esp_transport_sock_errno),
             data->error_handle->esp_tls_last_esp_err, data->error_handle->esp_tls_stack_err);
         } else if (data->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
