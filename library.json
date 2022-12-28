@@ -1,6 +1,6 @@
 {
   "name": "reMqtt",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "MQTT client for ESP32",
   "keywords": "mqtt",
   "authors":
