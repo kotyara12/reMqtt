@@ -2,16 +2,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "mbedtls/ssl.h"
 #include <time.h>
 #include "reTgSend.h"
 
 static const char* logTAG = "MQTT";
 
 #define MQTT_LOG_PAYLOAD_LIMIT 2048
-
-#if (defined(CONFIG_MQTT1_TYPE) && CONFIG_MQTT1_TLS_ENABLED && (CONFIG_MQTT1_TLS_STORAGE == TLS_CERT_BUNDLE)) || (defined(CONFIG_MQTT2_TYPE) && CONFIG_MQTT2_TLS_ENABLED && (CONFIG_MQTT2_TLS_STORAGE == TLS_CERT_BUNDLE))
-  #include "esp_crt_bundle.h"
-#endif // TLS_CERT_BUNDLE
 
 #if defined(CONFIG_MQTT1_TYPE) && CONFIG_MQTT1_TLS_ENABLED && !defined(CONFIG_MQTT1_TLS_STORAGE)
   #define CONFIG_MQTT1_TLS_STORAGE TLS_CERT_BUFFER
