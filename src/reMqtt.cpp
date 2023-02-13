@@ -731,63 +731,67 @@ void mqttSetConfigPrimary(esp_mqtt_client_config_t * mqttCfg)
   #else
     strcpy(_mqttData.host, CONFIG_MQTT1_HOST);
   #endif // CONFIG_MQTT1_TYPE == 2
-  mqttCfg->host = _mqttData.host;
+  mqttCfg->broker.address.hostname = _mqttData.host;
 
   // Port and transport
   #if CONFIG_MQTT1_TLS_ENABLED
     _mqttData.port = CONFIG_MQTT1_PORT_TLS;
-    mqttCfg->port = CONFIG_MQTT1_PORT_TLS;
-    mqttCfg->skip_cert_common_name_check = false;
-    mqttCfg->transport = MQTT_TRANSPORT_OVER_SSL;
+    mqttCfg->broker.address.port = CONFIG_MQTT1_PORT_TLS;
+    mqttCfg->broker.address.transport = MQTT_TRANSPORT_OVER_SSL;
+    mqttCfg->broker.verification.skip_cert_common_name_check = false;
     #if CONFIG_MQTT1_TLS_STORAGE == TLS_CERT_BUFFER
-      mqttCfg->cert_pem = (const char *)mqtt1_broker_pem_start;
-      mqttCfg->cert_len = mqtt1_broker_pem_end - mqtt1_broker_pem_start;
-      mqttCfg->use_global_ca_store = false;
+      mqttCfg->broker.verification.certificate = (const char *)mqtt1_broker_pem_start;
+      mqttCfg->broker.verification.certificate_len = mqtt1_broker_pem_end - mqtt1_broker_pem_start;
+      mqttCfg->broker.verification.use_global_ca_store = false;
     #elif CONFIG_MQTT1_TLS_STORAGE == TLS_CERT_GLOBAL
-      mqttCfg->use_global_ca_store = true;
+      mqttCfg->broker.verification.use_global_ca_store = true;
     #elif CONFIG_MQTT1_TLS_STORAGE == TLS_CERT_BUNDLE
-      mqttCfg->crt_bundle_attach = esp_crt_bundle_attach;
-      mqttCfg->use_global_ca_store = false;
+      mqttCfg->broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+      mqttCfg->broker.verification.use_global_ca_store = false;
     #endif // CONFIG_MQTT2_TLS_STORAGE
   #else
-    mqttCfg->transport = MQTT_TRANSPORT_OVER_TCP;
+    mqttCfg->broker.address.transport = MQTT_TRANSPORT_OVER_TCP;
     _mqttData.port = CONFIG_MQTT1_PORT_TCP;
-    mqttCfg->port = CONFIG_MQTT1_PORT_TCP;
+    mqttCfg->broker.address.port = CONFIG_MQTT1_PORT_TCP;
   #endif // CONFIG_MQTT1_TLS_ENABLED
 
   // Credentials
   #ifdef CONFIG_MQTT1_USERNAME
-    mqttCfg->username = CONFIG_MQTT1_USERNAME;
+    mqttCfg->credentials.username = CONFIG_MQTT1_USERNAME;
     #ifdef CONFIG_MQTT1_PASSWORD
-      mqttCfg->password = CONFIG_MQTT1_PASSWORD;
+      mqttCfg->credentials.authentication.password = CONFIG_MQTT1_PASSWORD;
     #endif // CONFIG_MQTT1_PASSWORD
   #endif // CONFIG_MQTT1_USERNAME
 
   // ClientId, if needed. Otherwise ClientId will be generated automatically
   #ifdef CONFIG_MQTT1_CLIENTID
-    mqttCfg->client_id = CONFIG_MQTT1_CLIENTID;
+    mqttCfg->credentials.client_id = CONFIG_MQTT1_CLIENTID;
   #endif // CONFIG_MQTT_CLIENTID
 
-  // Connection parameters
-  mqttCfg->network_timeout_ms = CONFIG_MQTT1_TIMEOUT;
-  mqttCfg->reconnect_timeout_ms = CONFIG_MQTT1_RECONNECT;
-  mqttCfg->disable_auto_reconnect = !CONFIG_MQTT1_AUTO_RECONNECT;
-  mqttCfg->disable_clean_session = !CONFIG_MQTT1_CLEAN_SESSION;
-  mqttCfg->keepalive = CONFIG_MQTT1_KEEP_ALIVE;
-  mqttCfg->disable_keepalive = false;
-  mqttCfg->buffer_size = CONFIG_MQTT_READ_BUFFER_SIZE;
-  mqttCfg->out_buffer_size = CONFIG_MQTT_WRITE_BUFFER_SIZE;
-  mqttCfg->task_prio = CONFIG_TASK_PRIORITY_MQTT_CLIENT;
-  mqttCfg->task_stack = CONFIG_MQTT_CLIENT_STACK_SIZE;
+  // Network parameters
+  mqttCfg->network.timeout_ms = CONFIG_MQTT1_TIMEOUT;
+  mqttCfg->network.reconnect_timeout_ms = CONFIG_MQTT1_RECONNECT;
+  mqttCfg->network.disable_auto_reconnect = !CONFIG_MQTT1_AUTO_RECONNECT;
+
+  // Session parameters
+  mqttCfg->session.disable_clean_session = !CONFIG_MQTT1_CLEAN_SESSION;
+  mqttCfg->session.keepalive = CONFIG_MQTT1_KEEP_ALIVE;
+  mqttCfg->session.disable_keepalive = false;
 
   // LWT
   #if CONFIG_MQTT_STATUS_LWT
-    mqttCfg->lwt_topic = mqttTopicStatusCreate(true);
-    mqttCfg->lwt_msg = CONFIG_MQTT_STATUS_LWT_PAYLOAD;
-    mqttCfg->lwt_msg_len = strlen(CONFIG_MQTT_STATUS_LWT_PAYLOAD);
-    mqttCfg->lwt_qos = CONFIG_MQTT_STATUS_QOS;
-    mqttCfg->lwt_retain = CONFIG_MQTT_STATUS_RETAINED;
+    mqttCfg->session.last_will.topic = mqttTopicStatusCreate(true);
+    mqttCfg->session.last_will.msg = CONFIG_MQTT_STATUS_LWT_PAYLOAD;
+    mqttCfg->session.last_will.msg_len = strlen(CONFIG_MQTT_STATUS_LWT_PAYLOAD);
+    mqttCfg->session.last_will.qos = CONFIG_MQTT_STATUS_QOS;
+    mqttCfg->session.last_will.retain = CONFIG_MQTT_STATUS_RETAINED;
   #endif // CONFIG_MQTT_STATUS_LWT
+
+  // Task & buffers
+  mqttCfg->task.priority = CONFIG_TASK_PRIORITY_MQTT_CLIENT;
+  mqttCfg->task.stack_size = CONFIG_MQTT_CLIENT_STACK_SIZE;
+  mqttCfg->buffer.size = CONFIG_MQTT_READ_BUFFER_SIZE;
+  mqttCfg->buffer.out_size = CONFIG_MQTT_WRITE_BUFFER_SIZE;
 }
 
 #ifdef CONFIG_MQTT2_TYPE
@@ -814,63 +818,67 @@ void mqttSetConfigReserved(esp_mqtt_client_config_t * mqttCfg)
   #else
     strcpy(_mqttData.host, CONFIG_MQTT2_HOST);
   #endif // CONFIG_MQTT1_TYPE == 2
-  mqttCfg->host = _mqttData.host;
+  mqttCfg->broker.address.hostname = _mqttData.host;
 
   // Port and transport
   #if CONFIG_MQTT2_TLS_ENABLED
     _mqttData.port = CONFIG_MQTT2_PORT_TLS;
-    mqttCfg->port = CONFIG_MQTT2_PORT_TLS;
-    mqttCfg->skip_cert_common_name_check = false;
-    mqttCfg->transport = MQTT_TRANSPORT_OVER_SSL;
+    mqttCfg->broker.address.port = CONFIG_MQTT2_PORT_TLS;
+    mqttCfg->broker.address.transport = MQTT_TRANSPORT_OVER_SSL;
+    mqttCfg->broker.verification.skip_cert_common_name_check = false;
     #if CONFIG_MQTT2_TLS_STORAGE == TLS_CERT_BUFFER
-      mqttCfg->cert_pem = (const char *)mqtt2_broker_pem_start;
-      mqttCfg->cert_len = mqtt2_broker_pem_end - mqtt2_broker_pem_start;
-      mqttCfg->use_global_ca_store = false;
+      mqttCfg->broker.verification.certificate = (const char *)mqtt2_broker_pem_start;
+      mqttCfg->broker.verification.certificate_len = mqtt2_broker_pem_end - mqtt2_broker_pem_start;
+      mqttCfg->broker.verification.use_global_ca_store = false;
     #elif CONFIG_MQTT2_TLS_STORAGE == TLS_CERT_GLOBAL
-      mqttCfg->use_global_ca_store = true;
+      mqttCfg->broker.verification.use_global_ca_store = true;
     #elif CONFIG_MQTT2_TLS_STORAGE == TLS_CERT_BUNDLE
-      mqttCfg->crt_bundle_attach = esp_crt_bundle_attach;
-      mqttCfg->use_global_ca_store = false;
+      mqttCfg->broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+      mqttCfg->broker.verification.use_global_ca_store = false;
     #endif // CONFIG_MQTT2_TLS_STORAGE
   #else
-    mqttCfg->transport = MQTT_TRANSPORT_OVER_TCP;
+    mqttCfg->broker.address.transport = MQTT_TRANSPORT_OVER_TCP;
     _mqttData.port = CONFIG_MQTT2_PORT_TCP;
-    mqttCfg->port = CONFIG_MQTT2_PORT_TCP;
+    mqttCfg->broker.address.port = CONFIG_MQTT2_PORT_TCP;
   #endif // CONFIG_MQTT2_TLS_ENABLED
 
   // Credentials
   #ifdef CONFIG_MQTT2_USERNAME
-    mqttCfg->username = CONFIG_MQTT2_USERNAME;
+    mqttCfg->credentials.username = CONFIG_MQTT2_USERNAME;
     #ifdef CONFIG_MQTT2_PASSWORD
-      mqttCfg->password = CONFIG_MQTT2_PASSWORD;
+      mqttCfg->credentials.authentication.password = CONFIG_MQTT2_PASSWORD;
     #endif // CONFIG_MQTT2_PASSWORD
   #endif // CONFIG_MQTT2_USERNAME
 
   // ClientId, if needed. Otherwise ClientId will be generated automatically
   #ifdef CONFIG_MQTT2_CLIENTID
-    mqttCfg->client_id = CONFIG_MQTT2_CLIENTID;
+    mqttCfg->credentials.client_id = CONFIG_MQTT2_CLIENTID;
   #endif // CONFIG_MQTT_CLIENTID
 
-  // Connection parameters
-  mqttCfg->network_timeout_ms = CONFIG_MQTT2_TIMEOUT;
-  mqttCfg->reconnect_timeout_ms = CONFIG_MQTT2_RECONNECT;
-  mqttCfg->disable_auto_reconnect = !CONFIG_MQTT2_AUTO_RECONNECT;
-  mqttCfg->disable_clean_session = !CONFIG_MQTT2_CLEAN_SESSION;
-  mqttCfg->keepalive = CONFIG_MQTT2_KEEP_ALIVE;
-  mqttCfg->disable_keepalive = false;
-  mqttCfg->buffer_size = CONFIG_MQTT_READ_BUFFER_SIZE;
-  mqttCfg->out_buffer_size = CONFIG_MQTT_WRITE_BUFFER_SIZE;
-  mqttCfg->task_prio = CONFIG_TASK_PRIORITY_MQTT_CLIENT;
-  mqttCfg->task_stack = CONFIG_MQTT_CLIENT_STACK_SIZE;
+  // Network parameters
+  mqttCfg->network.timeout_ms = CONFIG_MQTT2_TIMEOUT;
+  mqttCfg->network.reconnect_timeout_ms = CONFIG_MQTT2_RECONNECT;
+  mqttCfg->network.disable_auto_reconnect = !CONFIG_MQTT2_AUTO_RECONNECT;
+
+  // Session parameters
+  mqttCfg->session.disable_clean_session = !CONFIG_MQTT2_CLEAN_SESSION;
+  mqttCfg->session.keepalive = CONFIG_MQTT2_KEEP_ALIVE;
+  mqttCfg->session.disable_keepalive = false;
 
   // LWT
   #if CONFIG_MQTT_STATUS_LWT
-    mqttCfg->lwt_topic = mqttTopicStatusCreate(false);
-    mqttCfg->lwt_msg = CONFIG_MQTT_STATUS_LWT_PAYLOAD;
-    mqttCfg->lwt_msg_len = strlen(CONFIG_MQTT_STATUS_LWT_PAYLOAD);
-    mqttCfg->lwt_qos = CONFIG_MQTT_STATUS_QOS;
-    mqttCfg->lwt_retain = CONFIG_MQTT_STATUS_RETAINED;
+    mqttCfg->session.last_will.topic = mqttTopicStatusCreate(false);
+    mqttCfg->session.last_will.msg = CONFIG_MQTT_STATUS_LWT_PAYLOAD;
+    mqttCfg->session.last_will.msg_len = strlen(CONFIG_MQTT_STATUS_LWT_PAYLOAD);
+    mqttCfg->session.last_will.qos = CONFIG_MQTT_STATUS_QOS;
+    mqttCfg->session.last_will.retain = CONFIG_MQTT_STATUS_RETAINED;
   #endif // CONFIG_MQTT_STATUS_LWT
+
+  // Task & buffers
+  mqttCfg->task.priority = CONFIG_TASK_PRIORITY_MQTT_CLIENT;
+  mqttCfg->task.stack_size = CONFIG_MQTT_CLIENT_STACK_SIZE;
+  mqttCfg->buffer.size = CONFIG_MQTT_READ_BUFFER_SIZE;
+  mqttCfg->buffer.out_size = CONFIG_MQTT_WRITE_BUFFER_SIZE;
 }
 
 #endif // CONFIG_MQTT2_TYPE
@@ -943,9 +951,9 @@ esp_err_t mqttClientInitAndStart()
     mqttSetConfigPrimary(&_mqttCfg);
   #endif // CONFIG_MQTT2_TYPE
 
-  RE_MEM_CHECK_EVENT(_mqttCfg.host, return ESP_ERR_INVALID_ARG);
+  RE_MEM_CHECK_EVENT(_mqttCfg.broker.address.hostname, return ESP_ERR_INVALID_ARG);
   #if CONFIG_MQTT_STATUS_LWT
-    RE_MEM_CHECK_EVENT(_mqttCfg.lwt_topic, return ESP_ERR_INVALID_ARG);
+    RE_MEM_CHECK_EVENT(_mqttCfg.session.last_will.topic, return ESP_ERR_INVALID_ARG);
   #endif // CONFIG_MQTT_STATUS_LWT
     
   // Launching the client
