@@ -31,6 +31,12 @@ static esp_mqtt_client_handle_t _mqttClient = nullptr;
 static re_mqtt_event_data_t _mqttData;
 static uint32_t _mqttConnAttempt = 0;
 
+// Forward declarations
+esp_err_t mqttClientCreate();
+esp_err_t mqttClientRestart();
+esp_err_t mqttClientStop();
+esp_err_t mqttClientDestroy();
+
 // -----------------------------------------------------------------------------------------------------------------------
 // ----------------------------------------------------- Status bits -----------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
@@ -182,6 +188,7 @@ bool mqttBackToPrimaryTimerInit()
     cfg.skip_unhandled_events = false;
     cfg.callback = mqttBackToPrimaryTimerEnd;
     RE_OK_CHECK(esp_timer_create(&cfg, &_mqttBackToPrimaryTimer), return false);
+    rlog_i(logTAG, "The return timer to the main MQTT server is created");
   };
   return true;
 }
@@ -190,6 +197,7 @@ bool mqttBackToPrimaryTimerStop()
 {
   if ((_mqttBackToPrimaryTimer != nullptr) && esp_timer_is_active(_mqttBackToPrimaryTimer)) {
     RE_OK_CHECK(esp_timer_stop(_mqttBackToPrimaryTimer), return false);
+    rlog_i(logTAG, "The return timer to the main MQTT server was stopped");
   };  
   return true;
 }
@@ -199,6 +207,7 @@ bool mqttBackToPrimaryTimerFree()
   if (_mqttBackToPrimaryTimer != nullptr) {
     mqttBackToPrimaryTimerStop();
     RE_OK_CHECK(esp_timer_delete(_mqttBackToPrimaryTimer), return false);
+    rlog_i(logTAG, "The return timer to the main MQTT server is deleted");
   };
   return true;
 }
@@ -210,7 +219,9 @@ bool mqttBackToPrimaryTimerStart()
       return false;
     };
   };
+  mqttBackToPrimaryTimerStop();
   RE_OK_CHECK(esp_timer_start_once(_mqttBackToPrimaryTimer, 60000000UL*CONFIG_MQTT_BACK_TO_PRIMARY_TIME_MINUTES), return false);
+  rlog_i(logTAG, "The return timer to the main MQTT server was started");
   return true;
 }
 
@@ -338,11 +349,6 @@ void mqttTopicStatusFree()
 // -----------------------------------------------------------------------------------------------------------------------
 
 // Connect to server with new parameters
-esp_err_t mqttClientInitAndStart();
-esp_err_t mqttClientStart();
-esp_err_t mqttClientStop();
-esp_err_t mqttClientDestroy();
-
 bool mqttServer1isLocal()
 {
   return CONFIG_MQTT1_TYPE > 0;
@@ -377,11 +383,11 @@ bool mqttServer1Activate()
         return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SERVER_PRIMARY, nullptr, 0, portMAX_DELAY);
       } else {
         // The client is not running yet - you can just run it from this task
-        return mqttClientStart() == ESP_OK;
+        return mqttClientRestart() == ESP_OK;
       };
     } else {
-      // The client is not initialized
-      return mqttClientInitAndStart() == ESP_OK;
+      // The client has not yet been created
+      return mqttClientCreate() == ESP_OK;
     };
   };
   return true;
@@ -394,16 +400,16 @@ bool mqttServer2Activate()
     mqttBackToPrimaryTimerStart();
     mqttStatesSet(MQTTCLI_SERVER2_ACTIVE);
     if (_mqttClient) {
-      // The client is not initialized
-      return mqttClientInitAndStart() == ESP_OK;
-    } else {
       if (mqttStatesCheck(MQTTCLI_STARTED, false)) {
         // The client is already running - can only be restarted through the event loop (from another task)
         return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, nullptr, 0, portMAX_DELAY);
       } else {
         // The client is not running yet - you can just run it from this task
-        return mqttClientStart() == ESP_OK;
+        return mqttClientRestart() == ESP_OK;
       };
+    } else {
+      // The client has not yet been created
+      return mqttClientCreate() == ESP_OK;
     };
   };
   return true;
@@ -418,7 +424,7 @@ bool mqttServerSelectAuto()
     if (mqttServer2Enabled()) {
       return mqttServer2Activate();
     } else {
-      if (mqttStatesCheck(MQTTCLI_STARTED, false)) {
+      if (_mqttClient && mqttStatesCheck(MQTTCLI_STARTED, false)) {
         // Send event to suspend service
         return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SELF_STOP, nullptr, 0, portMAX_DELAY);
       };
@@ -444,22 +450,16 @@ bool mqttServerSelectAuto()
   if (mqttServer1Enabled()) {
     mqttStatesClear(MQTTCLI_SERVER2_ACTIVE);
     if (_mqttClient) {
-      if (mqttStatesCheck(MQTTCLI_STARTED, false)) {
-        // The client is already running
-        return true;
-      } else {
-        // The client is not running yet - you can just run it from this task
-        return mqttClientStart() == ESP_OK;
-      };
+      // The client is not running yet - you can just run it from this task
+      return mqttClientRestart() == ESP_OK;
     } else {
-      // The client is not initialized
-      return mqttClientInitAndStart() == ESP_OK;
+      // The client has not yet been created
+      return mqttClientCreate() == ESP_OK;
     };
   } else {
     // Send event to suspend service
     return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_SELF_STOP, nullptr, 0, portMAX_DELAY);
   };
-  return false;
 }
 
 #endif // CONFIG_MQTT2_TYPE
@@ -590,7 +590,11 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
     case MQTT_EVENT_BEFORE_CONNECT:
       _mqttConnAttempt++;
       mqttStatesClear(MQTTCLI_CONNECTED);
-      rlog_i(logTAG, "Attempt # %d to connect to MQTT broker [ %s : %d ]...", _mqttConnAttempt, _mqttData.host, _mqttData.port);
+      if (_mqttConnAttempt > 1) {
+        rlog_w(logTAG, "Attempt # %d to connect to MQTT broker [ %s : %d ]...", _mqttConnAttempt, _mqttData.host, _mqttData.port);
+      } else {
+        rlog_i(logTAG, "Attempt # %d to connect to MQTT broker [ %s : %d ]...", _mqttConnAttempt, _mqttData.host, _mqttData.port);
+      };
       #if CONFIG_SYSLED_MQTT_ACTIVITY
         ledSysActivity();
       #endif // CONFIG_SYSLED_MQTT_ACTIVITY
@@ -623,12 +627,13 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
         if (_mqttConnAttempt == CONFIG_MQTT_CONNECT_ATTEMPTS) {
           // Repost event to main event loop
           eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_FAILED, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
+          _mqttConnAttempt = 0;
           #ifdef CONFIG_MQTT2_TYPE
             // Switching to the another server - disable current server
             if (mqttStatesCheck(MQTTCLI_SERVER2_ACTIVE, false)) {
-              mqttServer1SetAvailable(false);
-            } else {
               mqttServer2SetAvailable(false);
+            } else {
+              mqttServer1SetAvailable(false);
             };
           #endif // CONFIG_MQTT2_TYPE
         };
@@ -673,6 +678,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
     
     case MQTT_EVENT_ERROR:
       if (event_data) {
+        rlog_e(logTAG, "MQTT client error!");
         // Generate error message
         if (data->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
           str_value = malloc_stringf("Transport error: %d\n  - %s\nESP_TLS error:   0x%X\nTLS stack error: 0x%X", 
@@ -687,7 +693,6 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
         };
         // Repost event to main event loop
         mqttErrorEventSend(str_value, nullptr);
-        if (str_value) rlog_e(logTAG, "MQTT client error: %s", str_value);
       };
       #if CONFIG_SYSLED_MQTT_ACTIVITY
         ledSysActivity();
@@ -711,8 +716,6 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
 
 void mqttSetConfigPrimary(esp_mqtt_client_config_t * mqttCfg)
 {
-  memset(mqttCfg, 0, sizeof(esp_mqtt_client_config_t));
-
   // Host
   _mqttData.primary = true;
   #if CONFIG_MQTT1_TYPE == 0
@@ -865,8 +868,6 @@ void mqttSetConfigPrimary(esp_mqtt_client_config_t * mqttCfg)
 
 void mqttSetConfigReserved(esp_mqtt_client_config_t * mqttCfg)
 {
-  memset(mqttCfg, 0, sizeof(esp_mqtt_client_config_t));
-
   // Host
   _mqttData.primary = false;
   #if CONFIG_MQTT2_TYPE == 0
@@ -1017,21 +1018,129 @@ void mqttSetConfigReserved(esp_mqtt_client_config_t * mqttCfg)
 
 #endif // CONFIG_MQTT2_TYPE
 
+esp_err_t mqttInitConfig(esp_mqtt_client_config_t * mqttCfg)
+{
+  RE_MEM_CHECK_EVENT(mqttCfg, return ESP_ERR_INVALID_ARG);
+
+  _mqttConnAttempt = 0;
+  memset(&_mqttData, 0, sizeof(_mqttData));
+  memset(mqttCfg, 0, sizeof(esp_mqtt_client_config_t));
+  mqttStatesClear(MQTTCLI_STARTED | MQTTCLI_CONNECTED);
+
+  #ifdef CONFIG_MQTT2_TYPE
+    mqttStatesCheck(MQTTCLI_SERVER2_ACTIVE, false) ? mqttSetConfigReserved(mqttCfg) : mqttSetConfigPrimary(mqttCfg);
+  #else
+    mqttSetConfigPrimary(mqttCfg);
+  #endif // CONFIG_MQTT2_TYPE
+
+  #if ESP_IDF_VERSION_MAJOR < 5
+    RE_MEM_CHECK_EVENT(mqttCfg->host, return ESP_ERR_INVALID_ARG);
+    #if CONFIG_MQTT_STATUS_LWT
+      RE_MEM_CHECK_EVENT(mqttCfg->lwt_topic, return ESP_ERR_INVALID_ARG);
+    #endif // CONFIG_MQTT_STATUS_LWT
+  #else
+    RE_MEM_CHECK_EVENT(mqttCfg->broker.address.hostname, return ESP_ERR_INVALID_ARG);
+    #if CONFIG_MQTT_STATUS_LWT
+      RE_MEM_CHECK_EVENT(mqttCfg->session.last_will.topic, return ESP_ERR_INVALID_ARG);
+    #endif // CONFIG_MQTT_STATUS_LWT
+  #endif // ESP_IDF_VERSION_MAJOR
+
+  return ESP_OK;
+}
+
 // -----------------------------------------------------------------------------------------------------------------------
 // --------------------------------------------------- Client routines ---------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
+
+esp_err_t mqttClientCreate() 
+{
+  if (_mqttClient == nullptr) {
+    rlog_i(logTAG, "Create MQTT client...");
+
+    // Set configuration
+    esp_mqtt_client_config_t _mqttCfg;
+    esp_err_t err = mqttInitConfig(&_mqttCfg);
+    if (err != ESP_OK) return err;
+
+    // Init client
+    _mqttClient = esp_mqtt_client_init(&_mqttCfg);
+    if (_mqttClient == nullptr) {
+      rlog_e(logTAG, "Failed to create task [ MQTT_CLIENT ]: out of memory");
+      mqttErrorEventSendCode("Failed to create task [ MQTT_CLIENT ]: %d %s", nullptr, ESP_ERR_NO_MEM);
+      return ESP_ERR_NO_MEM;
+    };
+    
+    err = esp_mqtt_client_register_event(_mqttClient, MQTT_EVENT_ANY, mqttEventHandler, _mqttClient);
+    if (err != ESP_OK) {
+      mqttErrorEventSendCode("Failed to create task (re) [ MQTT_CLIENT ]: %d %s", nullptr, err);
+      rlog_e(logTAG, "Failed to create task (re) [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
+    };
+
+    // Start client
+    err = esp_mqtt_client_start(_mqttClient);
+    if (err == ESP_OK) {
+      mqttStatesSet(MQTTCLI_STARTED);
+      rlog_i(logTAG, "Task [ MQTT_CLIENT ] was started");
+    } else {
+      mqttErrorEventSendCode("Failed to start task [ MQTT_CLIENT ]: %d %s", nullptr, err);
+      rlog_e(logTAG, "Failed to start task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
+    };
+
+    return err;
+  } else {
+    return mqttClientRestart();
+  };
+}
+
+esp_err_t mqttClientRestart()
+{
+  rlog_w(logTAG, "Restart MQTT client...");
+
+  // Close the current connection if it exists
+  esp_err_t err = mqttClientStop();
+  if (err != ESP_OK) return err;
+
+  // Set new configuration
+  esp_mqtt_client_config_t _mqttCfg;
+  err = mqttInitConfig(&_mqttCfg);
+  if (err != ESP_OK) return err;
+
+  err = esp_mqtt_set_config(_mqttClient, &_mqttCfg);
+  if (err != ESP_OK) {
+    mqttErrorEventSendCode("Failed to configure MQTT client [ MQTT_CLIENT ]: %d %s", nullptr, err);
+    rlog_e(logTAG, "Failed to configure MQTT client [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
+    return err;
+  };
+    
+  // Start client
+  err = esp_mqtt_client_start(_mqttClient);
+  if (err == ESP_OK) {
+    mqttStatesSet(MQTTCLI_STARTED);
+    rlog_i(logTAG, "Task [ MQTT_CLIENT ] was started");
+  } else {
+    mqttErrorEventSendCode("Failed to start task [ MQTT_CLIENT ]: %d %s", nullptr, err);
+    rlog_e(logTAG, "Failed to start task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
+  };
+  return err;
+}
 
 esp_err_t mqttClientStop()
 {
   if (_mqttClient) {
     if (mqttStatesCheck(MQTTCLI_STARTED, false)) {
+      rlog_w(logTAG, "Stop MQTT client...");
       esp_err_t err = esp_mqtt_client_stop(_mqttClient);
       if (err == ESP_OK) {
         if (mqttStatesCheck(MQTTCLI_CONNECTED, false)) {
           eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_CONN_LOST, &_mqttData, sizeof(_mqttData), portMAX_DELAY);
         };
-        mqttStatesClear(MQTTCLI_STARTED | MQTTCLI_CONNECTED);
         rlog_i(logTAG, "Task [ MQTT_CLIENT ] was stopped");
+        // Reset variables
+        _mqttConnAttempt = 0;
+        mqttStatesClear(MQTTCLI_STARTED | MQTTCLI_CONNECTED);
+        #if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
+          mqttTopicStatusFree();
+        #endif // CONFIG_MQTT_STATUS_LWT
       } else {
         mqttErrorEventSendCode("Failed to stop task [ MQTT_CLIENT ]: %d %s", nullptr, err);
         rlog_e(logTAG, "Failed to stop task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
@@ -1046,98 +1155,20 @@ esp_err_t mqttClientStop()
 esp_err_t mqttClientDestroy()
 {
   if (_mqttClient) {
+    rlog_w(logTAG, "Destroy MQTT client...");
     // Disсonnect from server and stop task
-    esp_err_t err = mqttClientStop();
+    mqttClientStop();
+    // Destoy client
+    esp_err_t err = esp_mqtt_client_destroy(_mqttClient);
     if (err == ESP_OK) {
-      err = esp_mqtt_client_destroy(_mqttClient);
-      if (err == ESP_OK) {
-        _mqttClient = nullptr;
-        _mqttConnAttempt = 0;
-        mqttStatesClear(MQTTCLI_STARTED | MQTTCLI_CONNECTED);
-        #if CONFIG_MQTT_STATUS_LWT || CONFIG_MQTT_STATUS_ONLINE
-          mqttTopicStatusFree();
-        #endif // CONFIG_MQTT_STATUS_LWT
-        rlog_d(logTAG, "Task [ MQTT_CLIENT ] was deleted");
-      } else {
-        rlog_e(logTAG, "Failed to destroy task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
-      };
+      // Reset variables
+      _mqttClient = nullptr;
+      rlog_i(logTAG, "Task [ MQTT_CLIENT ] was deleted");
+    } else {
+      rlog_e(logTAG, "Failed to destroy task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
     };
-    return err;
   };
   return ESP_OK;
-}
-
-esp_err_t mqttClientInitAndStart() 
-{
-  // Disconnect the current connection if it exists
-  mqttClientDestroy();
-
-  // Reset variables
-  _mqttConnAttempt = 0;
-  memset(&_mqttData, 0, sizeof(_mqttData));
-  mqttStatesClear(MQTTCLI_STARTED | MQTTCLI_CONNECTED);
-
-  // Configuring broker parameters
-  static esp_mqtt_client_config_t _mqttCfg;
-  #ifdef CONFIG_MQTT2_TYPE
-    mqttStatesCheck(MQTTCLI_SERVER2_ACTIVE, false) ? mqttSetConfigReserved(&_mqttCfg) : mqttSetConfigPrimary(&_mqttCfg);
-  #else
-    mqttSetConfigPrimary(&_mqttCfg);
-  #endif // CONFIG_MQTT2_TYPE
-
-  #if ESP_IDF_VERSION_MAJOR < 5
-    RE_MEM_CHECK_EVENT(_mqttCfg.host, return ESP_ERR_INVALID_ARG);
-    #if CONFIG_MQTT_STATUS_LWT
-      RE_MEM_CHECK_EVENT(_mqttCfg.lwt_topic, return ESP_ERR_INVALID_ARG);
-    #endif // CONFIG_MQTT_STATUS_LWT
-  #else
-    RE_MEM_CHECK_EVENT(_mqttCfg.broker.address.hostname, return ESP_ERR_INVALID_ARG);
-    #if CONFIG_MQTT_STATUS_LWT
-      RE_MEM_CHECK_EVENT(_mqttCfg.session.last_will.topic, return ESP_ERR_INVALID_ARG);
-    #endif // CONFIG_MQTT_STATUS_LWT
-  #endif // ESP_IDF_VERSION_MAJOR
-    
-  // Launching the client
-  _mqttClient = esp_mqtt_client_init(&_mqttCfg);
-  if (_mqttClient == nullptr) {
-    rlog_e(logTAG, "Failed to create task [ MQTT_CLIENT ]: out of memory");
-    mqttErrorEventSendCode("Failed to create task [ MQTT_CLIENT ]: %d %s", nullptr, ESP_ERR_NO_MEM);
-    return ESP_ERR_NO_MEM;
-  };
-  esp_err_t err = esp_mqtt_client_register_event(_mqttClient, MQTT_EVENT_ANY, mqttEventHandler, _mqttClient);
-  if (err != ESP_OK) {
-    mqttErrorEventSendCode("Failed to start task [ MQTT_CLIENT ]: %d %s", nullptr, err);
-    rlog_e(logTAG, "Failed to start task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
-  };
-  err = esp_mqtt_client_start(_mqttClient);
-  if (err != ESP_OK) {
-    mqttErrorEventSendCode("Failed to start task [ MQTT_CLIENT ]: %d %s", nullptr, err);
-    rlog_e(logTAG, "Failed to start task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
-  };
-  mqttStatesSet(MQTTCLI_STARTED);
-  rlog_i(logTAG, "Task [ MQTT_CLIENT ] was created");
-  return ESP_OK;
-}
-
-esp_err_t mqttClientStart()
-{
-  if (_mqttClient) {
-    if (!mqttStatesCheck(MQTTCLI_STARTED, false)) {
-      mqttStatesClear(MQTTCLI_CONNECTED);
-      esp_err_t err = esp_mqtt_client_start(_mqttClient);
-      if (err == ESP_OK) {
-        mqttStatesSet(MQTTCLI_STARTED);
-        rlog_i(logTAG, "Task [ MQTT_CLIENT ] was started");
-      } else {
-        mqttErrorEventSendCode("Failed to start task [ MQTT_CLIENT ]: %d %s", nullptr, err);
-        rlog_e(logTAG, "Failed to start task [ MQTT_CLIENT ]: %d %s", err, esp_err_to_name(err));
-      };
-      return err;
-    };
-    return ESP_OK;
-  } else {
-    return mqttClientInitAndStart();
-  };
 }
 
 // -----------------------------------------------------------------------------------------------------------------------
@@ -1160,7 +1191,7 @@ bool mqttTaskStart(bool createSuspended)
 
 bool mqttTaskRestart()
 {
-  return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_RESTART, nullptr, 0, portMAX_DELAY);
+  return eventLoopPost(RE_MQTT_EVENTS, RE_MQTT_COLD_RESTART, nullptr, 0, portMAX_DELAY);
 }
 
 bool mqttTaskFree()
@@ -1208,14 +1239,22 @@ static void mqttSelfEventHandler(void* arg, esp_event_base_t event_base, int32_t
 {
   if (event_id == RE_MQTT_SELF_STOP) {
     mqttClientStop();
-  } else if ((event_id == RE_MQTT_RESTART) || (event_id == RE_MQTT_SERVER_PRIMARY) || (event_id == RE_MQTT_SERVER_RESERVED)) {
+  } else if ((event_id == RE_MQTT_SERVER_PRIMARY) || (event_id == RE_MQTT_SERVER_RESERVED)) {
     uint8_t cntTry = 0;
-    while ((_mqttClient) && (cntTry < 60)) {
+    while (cntTry < 60) {
       cntTry++;
-      mqttClientDestroy();
+      if (mqttClientStop() == ESP_OK) break;
       vTaskDelay(pdMS_TO_TICKS(1000));
     };
-    mqttClientStart();
+    mqttClientRestart();
+  } else if (event_id == RE_MQTT_COLD_RESTART) {
+    uint8_t cntTry = 0;
+    while (cntTry < 60) {
+      cntTry++;
+      if (mqttClientDestroy() == ESP_OK) break;
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    };
+    mqttClientCreate();
   };
 }
 
@@ -1269,7 +1308,7 @@ bool mqttEventHandlerRegister()
       && eventHandlerRegister(RE_PING_EVENTS, RE_PING_MQTT2_AVAILABLE, &mqttPing2EventHandler, nullptr)
       && eventHandlerRegister(RE_PING_EVENTS, RE_PING_MQTT2_UNAVAILABLE, &mqttPing2EventHandler, nullptr)
       #endif // CONFIG_MQTT2_PING_CHECK
-      && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_RESTART, &mqttSelfEventHandler, nullptr)
+      && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_COLD_RESTART, &mqttSelfEventHandler, nullptr)
       && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_SELF_STOP, &mqttSelfEventHandler, nullptr)
       && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_SERVER_PRIMARY, &mqttSelfEventHandler, nullptr)
       && eventHandlerRegister(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, &mqttSelfEventHandler, nullptr);
@@ -1287,7 +1326,7 @@ void mqttEventHandlerUnregister()
     eventHandlerUnregister(RE_PING_EVENTS, RE_PING_MQTT2_AVAILABLE, &mqttPing2EventHandler);
     eventHandlerUnregister(RE_PING_EVENTS, RE_PING_MQTT2_UNAVAILABLE, &mqttPing2EventHandler);
   #endif // CONFIG_MQTT2_PING_CHECK
-  eventHandlerUnregister(RE_MQTT_EVENTS, RE_MQTT_RESTART, &mqttSelfEventHandler);
+  eventHandlerUnregister(RE_MQTT_EVENTS, RE_MQTT_COLD_RESTART, &mqttSelfEventHandler);
   eventHandlerUnregister(RE_MQTT_EVENTS, RE_MQTT_SELF_STOP, &mqttSelfEventHandler);
   eventHandlerUnregister(RE_MQTT_EVENTS, RE_MQTT_SERVER_PRIMARY, &mqttSelfEventHandler);
   eventHandlerUnregister(RE_MQTT_EVENTS, RE_MQTT_SERVER_RESERVED, &mqttSelfEventHandler);
