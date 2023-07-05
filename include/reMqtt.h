@@ -49,6 +49,7 @@ bool mqttEventHandlerRegister();
 void mqttEventHandlerUnregister();
 
 bool mqttIsConnected();
+bool mqttIsPrimary();
 int  mqttGetOutboxSize();
 bool mqttSubscribe(const char *topic, int qos);
 bool mqttUnsubscribe(const char *topic);

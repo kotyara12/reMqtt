@@ -258,6 +258,11 @@ bool mqttIsConnected()
   return wifiIsConnected() && (_mqttClient) && mqttStatesCheck(MQTTCLI_STARTED | MQTTCLI_CONNECTED, false);
 }
 
+bool mqttIsPrimary()
+{
+  return !mqttStatesCheck(MQTTCLI_SERVER2_ACTIVE, false);
+}
+
 int mqttGetOutboxSize()
 {
   return esp_mqtt_client_get_outbox_size(_mqttClient);
