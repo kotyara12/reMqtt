@@ -1216,24 +1216,19 @@ bool mqttTaskFree()
 
 static void mqttWiFiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
-  // STA connected, Internet access not checked
-  if (event_id == RE_WIFI_STA_GOT_IP) {
-    // rlog_v(logTAG, "Event received: RE_WIFI_STA_GOT_IP");
-    mqttServerSetInetAvailable(false);
-  }
   // STA connected and Internet access is available
-  else if (event_id == RE_WIFI_STA_PING_OK) {
-    // rlog_v(logTAG, "Event received: RE_WIFI_STA_PING_OK");
+  if (event_id == RE_WIFI_STA_PING_OK) {
+    rlog_d(logTAG, "Event received: RE_WIFI_STA_PING_OK");
     mqttServerSetInetAvailable(true);
   }
   // Internet access lost
   else if (event_id == RE_WIFI_STA_PING_FAILED) {
-    // rlog_v(logTAG, "Event received: RE_WIFI_STA_PING_FAILED");
+    rlog_d(logTAG, "Event received: RE_WIFI_STA_PING_FAILED");
     mqttServerSetInetAvailable(false);
   }
   // STA disconnected
   else if ((event_id == RE_WIFI_STA_DISCONNECTED) || (event_id == RE_WIFI_STA_STOPPED)) {
-    // rlog_v(logTAG, "Event received: RE_WIFI_STA_DISCONNECTED");
+    rlog_d(logTAG, "Event received: RE_WIFI_STA_DISCONNECTED");
     if (mqttStatesCheck(MQTTCLI_STARTED, false)) {
       mqttClientStop();
     };

@@ -23,7 +23,7 @@
 #include "reStates.h"
 #include "reEvents.h"
 #include "reEsp32.h"
-#include "reWifi.h"
+#include "reWiFi.h"
 #include "reNvs.h"
 #if CONFIG_MQTT_USE_LWMQTT_CLIENT
   #include "lwmqtt.h" 
