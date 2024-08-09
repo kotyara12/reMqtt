@@ -255,7 +255,7 @@ bool mqttBackToPrimaryTimerStop()
 
 bool mqttIsConnected() 
 {
-  return wifiIsConnected() && (_mqttClient) && mqttStatesCheck(MQTTCLI_STARTED | MQTTCLI_CONNECTED, false);
+  return statesNetworkIsConnected() && (_mqttClient) && mqttStatesCheck(MQTTCLI_STARTED | MQTTCLI_CONNECTED, false);
 }
 
 bool mqttIsPrimary()
@@ -1217,22 +1217,31 @@ bool mqttTaskFree()
 static void mqttWiFiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
   // STA connected and Internet access is available
-  if (event_id == RE_WIFI_STA_PING_OK) {
-    rlog_d(logTAG, "Event received: RE_WIFI_STA_PING_OK");
+  if (event_id == RE_INET_PING_OK) {
+    rlog_d(logTAG, "Event received: RE_INET_PING_OK");
     mqttServerSetInetAvailable(true);
   }
   // Internet access lost
-  else if (event_id == RE_WIFI_STA_PING_FAILED) {
-    rlog_d(logTAG, "Event received: RE_WIFI_STA_PING_FAILED");
+  else if (event_id == RE_INET_PING_FAILED) {
+    rlog_d(logTAG, "Event received: RE_INET_PING_FAILED");
     mqttServerSetInetAvailable(false);
   }
   // STA disconnected
   else if ((event_id == RE_WIFI_STA_DISCONNECTED) || (event_id == RE_WIFI_STA_STOPPED)) {
     rlog_d(logTAG, "Event received: RE_WIFI_STA_DISCONNECTED");
-    if (mqttStatesCheck(MQTTCLI_STARTED, false)) {
+    if (!statesNetworkIsConnected() && mqttStatesCheck(MQTTCLI_STARTED, false)) {
       mqttClientStop();
     };
-  };
+  }
+  // Ethernet disconnected
+  #if defined(CONFIG_ETH_ENABLED) && (CONFIG_ETH_ENABLED == 1)
+    else if ((event_id == RE_ETHERNET_DISCONNECTED) || (event_id == RE_ETHERNET_STOPPED)) {
+      rlog_d(logTAG, "Event received: RE_ETHERNET_DISCONNECTED");
+      if (!statesNetworkIsConnected() && mqttStatesCheck(MQTTCLI_STARTED, false)) {
+        mqttClientStop();
+      };
+    }
+  #endif // CONFIG_ETH_ENABLED
 }
 
 static void mqttSelfEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
