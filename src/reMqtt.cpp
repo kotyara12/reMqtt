@@ -4,7 +4,9 @@
 #include "freertos/task.h"
 #include "mbedtls/ssl.h"
 #include <time.h>
-#include "reTgSend.h"
+#if CONFIG_TELEGRAM_ENABLE
+  #include "reTgSend.h"
+#endif // CONFIG_TELEGRAM_ENABLE
 
 static const char* logTAG = "MQTT";
 
